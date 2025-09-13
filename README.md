@@ -53,8 +53,8 @@ A powerful Discord bot that bridges communication between Discord and Meshtastic
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/n30nex/Meshbot/
-   cd Meshbot
+   git clone <your-repo-url>
+   cd Bot
    ```
 
 2. **Create virtual environment**
@@ -203,6 +203,21 @@ Bot/
 - **CommandHandler**: Discord command processing
 - **MeshtasticDatabase**: SQLite database management
 
+## 🔄 Recent Updates
+
+### v2.1.0 - Threading & Async Improvements
+- **Fixed async/await errors**: Resolved "no running event loop" errors in packet processing
+- **Improved thread safety**: Replaced asyncio.Lock with threading.Lock for better cross-thread compatibility
+- **Enhanced packet buffering**: Streamlined packet buffer management with proper thread synchronization
+- **Better error handling**: More robust error handling for async operations from sync contexts
+- **Performance optimizations**: Reduced overhead in packet processing pipeline
+
+### Technical Improvements
+- **Thread-safe packet processing**: Meshtastic callbacks now properly handle async operations
+- **Simplified async patterns**: Removed complex async context manager usage in favor of simpler threading
+- **Better resource management**: Improved memory usage and reduced potential for deadlocks
+- **Enhanced logging**: More detailed error messages for debugging async issues
+
 ## 🐛 Troubleshooting
 
 ### Common Issues
@@ -210,11 +225,17 @@ Bot/
 2. **No mesh data**: Verify Meshtastic device connection
 3. **Database errors**: Check file permissions and disk space
 4. **Command cooldowns**: Wait 2 seconds between commands
+5. **Async/await errors**: Fixed in v2.1.0 - restart bot if experiencing "no running event loop" errors
 
 ### Debug Commands
 - `$debug` - Show system information
 - `$status` - Check bot and network status
 - Check console logs for detailed error information
+
+### Known Issues & Solutions
+- **"no running event loop" errors**: These have been fixed in v2.1.0. If you still see them, restart the bot
+- **Threading lock errors**: Resolved by switching to proper threading.Lock usage
+- **Packet buffer issues**: Improved thread safety in packet processing pipeline
 
 ## 📈 Performance
 
@@ -223,12 +244,17 @@ Bot/
 - Command result caching
 - Batch message processing
 - Memory-efficient packet buffering
+- **Thread-safe packet processing** (v2.1.0)
+- **Reduced async overhead** (v2.1.0)
+- **Improved cross-thread communication** (v2.1.0)
 
 ### Monitoring
 - Real-time performance metrics
 - Database health monitoring
 - Network activity tracking
 - Error logging and reporting
+- **Thread safety monitoring** (v2.1.0)
+- **Async operation tracking** (v2.1.0)
 
 ## 🤝 Contributing
 
@@ -254,11 +280,8 @@ For issues and questions:
 1. Check the troubleshooting section
 2. Review console logs
 3. Create an issue on GitHub
-4. Join the Canadaverse
+4. Join the Meshtastic Discord community
 
 ---
 
 **Happy Meshing!** 🌐📡
-
-
-

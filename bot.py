@@ -4,6 +4,7 @@ import os
 import sys
 import io
 import logging
+import threading
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from dotenv import load_dotenv
@@ -17,6 +18,7 @@ from datetime import datetime, timedelta
 from database import MeshtasticDatabase
 import functools
 import weakref
+from config import BOT_CONFIG, LOGGING_CONFIG
 
 # Configure logging
 logging.basicConfig(
@@ -84,9 +86,9 @@ class Config:
     discord_token: str
     channel_id: int
     meshtastic_hostname: Optional[str]
-    message_max_length: int = 225
-    node_refresh_interval: int = 60  # seconds
-    active_node_threshold: int = 60  # minutes (changed from 15 to 60)
+    message_max_length: int = BOT_CONFIG['message_max_length']
+    node_refresh_interval: int = BOT_CONFIG['node_refresh_interval']
+    active_node_threshold: int = BOT_CONFIG['active_node_threshold']  # minutes (now using config.py value)
     telemetry_update_interval: int = 3600  # 1 hour in seconds
 
 class MeshtasticInterface:
@@ -285,10 +287,11 @@ class MeshtasticInterface:
 class CommandHandler:
     """Handles Discord bot commands with caching and performance optimizations"""
     
-    def __init__(self, meshtastic: MeshtasticInterface, discord_to_mesh: queue.Queue, database: MeshtasticDatabase):
+    def __init__(self, meshtastic: MeshtasticInterface, discord_to_mesh: queue.Queue, database: MeshtasticDatabase, event_loop=None):
         self.meshtastic = meshtastic
         self.discord_to_mesh = discord_to_mesh
         self.database = database
+        self.event_loop = event_loop
         self.commands = {
             '$help': self.cmd_help,
             '$txt': self.cmd_send_primary,  # Changed from $sendprimary
@@ -312,6 +315,7 @@ class CommandHandler:
         self._node_cache = {}
         self._cache_timestamps = {}
         self._cache_ttl = 60  # 1 minute cache TTL
+        self._cache_lock = asyncio.Lock()  # Thread safety for cache operations
         
         # Rate limiting
         self._command_cooldowns = {}
@@ -321,6 +325,7 @@ class CommandHandler:
         self._live_monitors = {}  # user_id -> {'active': bool, 'task': asyncio.Task}
         self._packet_buffer = []  # Store recent packets for live display
         self._max_packet_buffer = 50  # Keep last 50 packets
+        self._packet_buffer_lock = threading.Lock()  # Thread safety for packet buffer
     
     async def handle_command(self, message: discord.Message) -> bool:
         """Route command to appropriate handler with rate limiting"""
@@ -352,44 +357,54 @@ class CommandHandler:
         
         return False
     
-    def _get_cached_data(self, key: str, fetch_func, *args, **kwargs):
-        """Get data from cache or fetch if not available"""
+    async def _get_cached_data(self, key: str, fetch_func, *args, **kwargs):
+        """Get data from cache or fetch if not available (thread-safe)"""
         now = time.time()
         
-        if (key in self._node_cache and 
-            key in self._cache_timestamps and 
-            now - self._cache_timestamps[key] < self._cache_ttl):
-            return self._node_cache[key]
+        async with self._cache_lock:
+            # Check cache first
+            if (key in self._node_cache and 
+                key in self._cache_timestamps and 
+                now - self._cache_timestamps[key] < self._cache_ttl):
+                return self._node_cache[key]
         
-        # Fetch fresh data
+        # Fetch fresh data outside the lock to avoid blocking
         try:
             data = fetch_func(*args, **kwargs)
-            self._node_cache[key] = data
-            self._cache_timestamps[key] = now
+            
+            # Update cache with lock
+            async with self._cache_lock:
+                self._node_cache[key] = data
+                self._cache_timestamps[key] = now
+            
             return data
         except Exception as e:
             logger.error(f"Error fetching data for cache key {key}: {e}")
             # Return cached data if available, even if stale
-            return self._node_cache.get(key, [])
+            async with self._cache_lock:
+                return self._node_cache.get(key, [])
     
-    def clear_cache(self):
-        """Clear all cached data"""
-        self._node_cache.clear()
-        self._cache_timestamps.clear()
+    async def clear_cache(self):
+        """Clear all cached data (thread-safe)"""
+        async with self._cache_lock:
+            self._node_cache.clear()
+            self._cache_timestamps.clear()
         logger.info("Command handler cache cleared")
     
     def add_packet_to_buffer(self, packet_info: dict):
-        """Add packet information to the live monitor buffer"""
+        """Add packet information to the live monitor buffer (thread-safe)"""
         try:
             # Add timestamp
             packet_info['timestamp'] = datetime.utcnow().isoformat()
             
-            # Add to buffer
-            self._packet_buffer.append(packet_info)
-            
-            # Keep only the last N packets
-            if len(self._packet_buffer) > self._max_packet_buffer:
-                self._packet_buffer.pop(0)
+            # Thread-safe buffer update using regular lock
+            with self._packet_buffer_lock:
+                # Add to buffer
+                self._packet_buffer.append(packet_info)
+                
+                # Keep only the last N packets
+                if len(self._packet_buffer) > self._max_packet_buffer:
+                    self._packet_buffer.pop(0)
                 
         except Exception as e:
             logger.error(f"Error adding packet to buffer: {e}")
@@ -434,10 +449,10 @@ class CommandHandler:
         # Basic Commands
         embed.add_field(
             name="📡 **Basic Commands**",
-            value="""`$help` - Show this help message
+            value=f"""`$help` - Show this help message
 `$txt <message>` - Send message to primary channel (max 225 chars)
 `$send <longname> <message>` - Send message to specific node by name
-`$activenodes` - Show nodes active in last 60 minutes
+`$activenodes` - Show nodes active in last {BOT_CONFIG['active_node_threshold']} minutes
 `$nodes` - Show all known nodes
 `$telem` - Show telemetry information
 `$status` - Show bridge status
@@ -497,7 +512,11 @@ class CommandHandler:
             return
         
         await self._safe_send(message.channel, f"📤 Sending to primary channel:\n```{message_text}```")
-        self.discord_to_mesh.put(message_text)
+        try:
+            self.discord_to_mesh.put_nowait(message_text)
+        except queue.Full:
+            logger.warning("Discord to mesh queue is full, dropping message")
+            return False
     
     async def cmd_send_node(self, message: discord.Message):
         """Send message to specific node using fuzzy name matching"""
@@ -554,7 +573,12 @@ class CommandHandler:
                 final_node_id = clean_node_id
             
             await self._safe_send(message.channel, f"📤 Sending to node **{node['long_name']}** (ID: {final_node_id}):\n```{message_text}```")
-            self.discord_to_mesh.put(f"nodenum={final_node_id} {message_text}")
+            try:
+                self.discord_to_mesh.put_nowait(f"nodenum={final_node_id} {message_text}")
+            except queue.Full:
+                logger.warning("Discord to mesh queue is full, dropping message")
+                await self._safe_send(message.channel, "❌ Message queue is full, please try again later.")
+                return
             logger.info(f"Sent message with node ID: {final_node_id}")
             
         except Exception as e:
@@ -562,18 +586,18 @@ class CommandHandler:
             await self._safe_send(message.channel, "❌ Error parsing command. Use format: `$send <longname> <message>`")
     
     async def cmd_active_nodes(self, message: discord.Message):
-        """Show active nodes from last 60 minutes"""
+        """Show active nodes from last {} minutes""".format(BOT_CONFIG['active_node_threshold'])
         try:
             # Use caching for better performance
-            nodes = self._get_cached_data(
-                "active_nodes_60", 
+            nodes = await self._get_cached_data(
+                f"active_nodes_{BOT_CONFIG['active_node_threshold']}", 
                 self.database.get_active_nodes, 
-                60
+                BOT_CONFIG['active_node_threshold']
             )
             if not nodes:
                 embed = discord.Embed(
                     title="📡 Active Nodes",
-                    description="No active nodes in the last 60 minutes",
+                    description=f"No active nodes in the last {BOT_CONFIG['active_node_threshold']} minutes",
                     color=0xff6b6b,
                     timestamp=get_utc_time()
                 )
@@ -595,7 +619,7 @@ class CommandHandler:
                 logger.error(f"Error processing node {node.get('node_id', 'Unknown')}: {e}")
                 continue
         
-        response = "📡 **Active Nodes (Last 60 minutes):**\n" + "\n".join(active_nodes)
+        response = f"📡 **Active Nodes (Last {BOT_CONFIG['active_node_threshold']} minutes):**\n" + "\n".join(active_nodes)
         try:
             await self._send_long_message(message.channel, response)
         except Exception as send_error:
@@ -606,7 +630,7 @@ class CommandHandler:
         """Show all known nodes"""
         try:
             # Use caching for better performance
-            nodes = self._get_cached_data(
+            nodes = await self._get_cached_data(
                 "all_nodes", 
                 self.database.get_all_nodes
             )
@@ -811,7 +835,7 @@ Current Time: {format_utc_time()}""",
         """Show network topology and connections with ASCII network diagram"""
         try:
             topology = self.database.get_network_topology()
-            nodes = self._get_cached_data("all_nodes", self.database.get_all_nodes)
+            nodes = await self._get_cached_data("all_nodes", self.database.get_all_nodes)
             
             embed = discord.Embed(
                 title="🌐 Network Topology",
@@ -872,7 +896,7 @@ Avg Hops: {topology['avg_hops']:.1f}""",
     async def cmd_topology_tree(self, message: discord.Message):
         """Show visual tree of all radio connections"""
         try:
-            nodes = self._get_cached_data("all_nodes", self.database.get_all_nodes)
+            nodes = await self._get_cached_data("all_nodes", self.database.get_all_nodes)
             topology = self.database.get_network_topology()
             
             if not nodes:
@@ -1201,7 +1225,7 @@ Active Hours: {len(hourly_dist)}""",
     async def cmd_leaderboard(self, message: discord.Message):
         """Show network performance leaderboards"""
         try:
-            nodes = self._get_cached_data("all_nodes", self.database.get_all_nodes)
+            nodes = await self._get_cached_data("all_nodes", self.database.get_all_nodes)
             stats = self.database.get_message_statistics(24)
             
             if not nodes:
@@ -1300,7 +1324,7 @@ Unique Senders: {stats.get('unique_senders', 0)}""",
     async def cmd_network_art(self, message: discord.Message):
         """Create ASCII network art"""
         try:
-            nodes = self._get_cached_data("all_nodes", self.database.get_all_nodes)
+            nodes = await self._get_cached_data("all_nodes", self.database.get_all_nodes)
             topology = self.database.get_network_topology()
             
             if not nodes:
@@ -1475,13 +1499,17 @@ Art Quality: {'🎨' * min(5, total_nodes // 2)}""",
                 if user_id not in self._live_monitors or not self._live_monitors[user_id]['active']:
                     break
                 
-                # Check for new packets in buffer
-                current_packets = len(self._packet_buffer)
-                if current_packets > packet_count:
-                    # New packets available, update display
-                    new_packets = self._packet_buffer[packet_count:]
-                    packet_count = current_packets
-                    
+                # Check for new packets in buffer (thread-safe)
+                with self._packet_buffer_lock:
+                    current_packets = len(self._packet_buffer)
+                    if current_packets > packet_count:
+                        # New packets available, copy them
+                        new_packets = self._packet_buffer[packet_count:].copy()
+                        packet_count = current_packets
+                    else:
+                        new_packets = []
+                
+                if new_packets:
                     # Update status message with new packets
                     await self._update_live_display(channel, status_message, new_packets, time.time() - start_time)
                     last_update = time.time()
@@ -1612,7 +1640,7 @@ Art Quality: {'🎨' * min(5, total_nodes // 2)}""",
                 logger.info("Database cleared by user command")
             
             # Clear command handler cache
-            self.clear_cache()
+            await self.clear_cache()
             
             embed = discord.Embed(
                 title="🗑️ Database Cleared",
@@ -1895,7 +1923,8 @@ Last Heard: {nodes[0].get('last_heard', 'Unknown')}""",
                 try:
                     last_heard = datetime.fromisoformat(node['last_heard'])
                     time_str = last_heard.strftime('%H:%M:%S')
-                except:
+                except (ValueError, TypeError, KeyError) as e:
+                    logger.debug(f"Error parsing last_heard timestamp: {e}")
                     time_str = "Unknown"
             else:
                 time_str = "Unknown"
@@ -2114,8 +2143,10 @@ Connections: {len(connections)} active"""
             # Try to send a simple error message
             try:
                 await channel.send("❌ Error sending message to channel.")
-            except:
-                pass
+            except discord.HTTPException as e:
+                logger.error(f"Failed to send error message to channel: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error sending error message: {e}")
     
     async def _safe_send(self, channel, message: str):
         """Safely send a message to a channel with error handling"""
@@ -2136,11 +2167,11 @@ class DiscordBot(discord.Client):
         self.meshtastic = meshtastic
         self.database = database
         
-        # Queues for communication
-        self.mesh_to_discord = queue.Queue()
-        self.discord_to_mesh = queue.Queue()
+        # Queues for communication with size limits to prevent memory exhaustion
+        self.mesh_to_discord = queue.Queue(maxsize=1000)  # Limit to 1000 messages
+        self.discord_to_mesh = queue.Queue(maxsize=100)   # Limit to 100 outgoing messages
         
-        # Initialize command handler after queues are created
+        # Initialize command handler after queues are created (event loop will be set later)
         self.command_handler = CommandHandler(meshtastic, self.discord_to_mesh, database)
         
         # Background task
@@ -2159,6 +2190,9 @@ class DiscordBot(discord.Client):
         """Called when bot is ready"""
         logger.info(f'Logged in as {self.user} (ID: {self.user.id})')
         logger.info('------')
+        
+        # Set event loop for command handler
+        self.command_handler.event_loop = self.loop
         
         # Connect to Meshtastic
         if not await self.meshtastic.connect():
@@ -2298,7 +2332,7 @@ class DiscordBot(discord.Client):
         try:
             # Clear command handler cache
             if hasattr(self.command_handler, 'clear_cache'):
-                self.command_handler.clear_cache()
+                await self.command_handler.clear_cache()
             
             # Clean up old database data
             if hasattr(self.database, 'cleanup_old_data'):
@@ -2678,7 +2712,16 @@ class DiscordBot(discord.Client):
                     'rssi': packet.get('rssi'),
                     'timestamp': datetime.utcnow().isoformat() + 'Z'
                 }
-                self.mesh_to_discord.put(msg_payload)
+                try:
+                    self.mesh_to_discord.put_nowait(msg_payload)
+                except queue.Full:
+                    logger.warning("Mesh to Discord queue is full, dropping message")
+                    # Optionally remove oldest message to make room
+                    try:
+                        self.mesh_to_discord.get_nowait()
+                        self.mesh_to_discord.put_nowait(msg_payload)
+                    except queue.Empty:
+                        pass
                 logger.info(f"💬 MESSAGE: Queued for Discord - '{text[:50]}{'...' if len(text) > 50 else ''}' from {from_name}")
                 
                 # Add text message to live monitor buffer
@@ -2936,7 +2979,16 @@ class DiscordBot(discord.Client):
                         'hops_count': hops_count,
                         'timestamp': datetime.utcnow().isoformat() + 'Z'
                     }
-                    self.mesh_to_discord.put(traceroute_payload)
+                    try:
+                        self.mesh_to_discord.put_nowait(traceroute_payload)
+                    except queue.Full:
+                        logger.warning("Mesh to Discord queue is full, dropping traceroute")
+                        # Keep oldest messages for traceroute as they're important
+                        try:
+                            self.mesh_to_discord.get_nowait()
+                            self.mesh_to_discord.put_nowait(traceroute_payload)
+                        except queue.Empty:
+                            pass
                     logger.info(f"🛣️ TRACEROUTE: Queued route info - {from_name} → {to_name} ({hops_count} hops)")
                     
                     # Add traceroute to live monitor buffer
@@ -3017,7 +3069,16 @@ class DiscordBot(discord.Client):
                             }
                             
                             # Queue for Discord
-                            self.mesh_to_discord.put(movement_payload)
+                            try:
+                                self.mesh_to_discord.put_nowait(movement_payload)
+                            except queue.Full:
+                                logger.warning("Mesh to Discord queue is full, dropping movement notification")
+                                # Movement notifications are important, so try to make room
+                                try:
+                                    self.mesh_to_discord.get_nowait()
+                                    self.mesh_to_discord.put_nowait(movement_payload)
+                                except queue.Empty:
+                                    pass
                             logger.info(f"🚶 MOVEMENT: {from_name} moved {distance_moved:.1f}m from last position")
                             
                             # Add to live monitor buffer

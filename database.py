@@ -204,9 +204,21 @@ class MeshtasticDatabase:
                 ('ch8_current', 'REAL')
             ]
             
-            # Add missing columns
+            # Add missing columns with validation
             for column_name, column_type in new_columns:
                 if column_name not in columns:
+                    # Validate column name to prevent injection (alphanumeric and underscore only)
+                    if not column_name.replace('_', '').isalnum():
+                        logger.error(f"Invalid column name: {column_name}")
+                        continue
+                    
+                    # Validate column type
+                    valid_types = ['TEXT', 'INTEGER', 'REAL', 'BLOB', 'NULL']
+                    if column_type not in valid_types:
+                        logger.error(f"Invalid column type: {column_type}")
+                        continue
+                    
+                    # Safe to execute as we've validated both inputs
                     cursor.execute(f"ALTER TABLE telemetry ADD COLUMN {column_name} {column_type}")
                     logger.info(f"Added column {column_name} to telemetry table")
                     
