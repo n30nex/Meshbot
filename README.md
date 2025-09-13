@@ -53,8 +53,8 @@ A powerful Discord bot that bridges communication between Discord and Meshtastic
 
 1. **Clone the repository**
    ```bash
-   git clone <your-repo-url>
-   cd Bot
+   git clone https://github.com/n30nex/Meshbot
+   cd Meshbot
    ```
 
 2. **Create virtual environment**
@@ -285,3 +285,4 @@ For issues and questions:
 ---
 
 **Happy Meshing!** 🌐📡
+
