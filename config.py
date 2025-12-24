@@ -51,7 +51,7 @@ BOT_CONFIG = {
 LOGGING_CONFIG = {
     'level': 'INFO',
     'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    'file': 'bot.log',
+    'file': 'logs/bot.log',
     'max_size': 10 * 1024 * 1024,  # 10MB
     'backup_count': 5,
     'structured': False,
@@ -144,4 +144,14 @@ MESSAGE_TEMPLATES = {
 HIGH_ALTITUDE = {
     'high_altitude_threshold_m': 1500,
     'high_altitude_cooldown_minutes': 180,
+}
+
+# Movement detection
+MOVEMENT_DETECTION = {
+    'distance_threshold_m': 100.0,
+    'speed_threshold_mps': 3.0,
+    'speed_distance_floor_m': 25.0,
+    'jitter_floor_m': 15.0,
+    'min_interval_seconds': 15,
+    'alert_cooldown_seconds': 300,
 }

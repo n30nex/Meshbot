@@ -58,6 +58,8 @@ class MeshtasticDatabase:
                         last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         last_heard TIMESTAMP,
                         hops_away INTEGER DEFAULT 0,
+                        next_hop_node_id TEXT,
+                        last_relay_node_id TEXT,
                         is_router BOOLEAN DEFAULT FALSE,
                         is_client BOOLEAN DEFAULT TRUE,
                         announced_at TIMESTAMP,
@@ -65,6 +67,17 @@ class MeshtasticDatabase:
                         labels TEXT
                     )
                 """)
+
+                cursor.execute("PRAGMA table_info(nodes)")
+                node_columns = {row[1] for row in cursor.fetchall()}
+                if "next_hop_node_id" not in node_columns:
+                    cursor.execute(
+                        "ALTER TABLE nodes ADD COLUMN next_hop_node_id TEXT"
+                    )
+                if "last_relay_node_id" not in node_columns:
+                    cursor.execute(
+                        "ALTER TABLE nodes ADD COLUMN last_relay_node_id TEXT"
+                    )
 
                 # Telemetry table - stores telemetry data
                 cursor.execute("""
@@ -529,6 +542,8 @@ class MeshtasticDatabase:
                             last_seen = CURRENT_TIMESTAMP,
                             last_heard = COALESCE(?, last_heard),
                             hops_away = ?,
+                            next_hop_node_id = COALESCE(?, next_hop_node_id),
+                            last_relay_node_id = COALESCE(?, last_relay_node_id),
                             is_router = ?,
                             is_client = ?
                         WHERE node_id = ?
@@ -542,6 +557,8 @@ class MeshtasticDatabase:
                             node_data.get("firmware_version"),
                             node_data.get("last_heard"),
                             node_data.get("hops_away", 0),
+                            node_data.get("next_hop_node_id"),
+                            node_data.get("last_relay_node_id"),
                             node_data.get("is_router", False),
                             node_data.get("is_client", True),
                             node_data["node_id"],
@@ -555,8 +572,9 @@ class MeshtasticDatabase:
                         INSERT INTO nodes (
                             node_id, node_num, long_name, short_name, macaddr,
                             hw_model, firmware_version, last_heard, hops_away,
+                            next_hop_node_id, last_relay_node_id,
                             is_router, is_client, announced_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                         (
                             node_data["node_id"],
@@ -568,6 +586,8 @@ class MeshtasticDatabase:
                             node_data.get("firmware_version"),
                             node_data.get("last_heard"),
                             node_data.get("hops_away", 0),
+                            node_data.get("next_hop_node_id"),
+                            node_data.get("last_relay_node_id"),
                             node_data.get("is_router", False),
                             node_data.get("is_client", True),
                             None,
@@ -943,6 +963,27 @@ class MeshtasticDatabase:
             logger.error(f"Unexpected error updating last_heard: {e}")
             return False
 
+    def update_last_relay(self, node_id: str, relay_node_id: str) -> bool:
+        """Update the last relay node ID for a node."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE nodes SET last_relay_node_id = ? WHERE node_id = ?",
+                    (relay_node_id, node_id),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.OperationalError as e:
+            logger.error(f"Database operational error updating last_relay: {e}")
+            return False
+        except sqlite3.Error as e:
+            logger.error(f"Database error updating last_relay: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error updating last_relay: {e}")
+            return False
+
     def get_active_nodes(self, minutes: int = 60) -> List[Dict[str, Any]]:
         """Get nodes active in the last N minutes"""
         try:
@@ -998,14 +1039,13 @@ class MeshtasticDatabase:
             logger.error(f"Unexpected error getting active nodes: {e}")
             return []
 
-    def get_all_nodes(self, limit: int = 200) -> List[Dict[str, Any]]:
+    def get_all_nodes(self, limit: Optional[int] = 200) -> List[Dict[str, Any]]:
         """Get all known nodes with optimized query using indexed lookups"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
 
-                cursor.execute(
-                    """
+                query = """
                     SELECT
                         n.*,
                         (SELECT battery_level FROM telemetry t WHERE t.node_id = n.node_id AND battery_level IS NOT NULL ORDER BY timestamp DESC LIMIT 1) AS battery_level,
@@ -1028,10 +1068,12 @@ class MeshtasticDatabase:
                         (SELECT timestamp FROM positions p WHERE p.node_id = n.node_id ORDER BY timestamp DESC LIMIT 1) AS position_ts
                     FROM nodes n
                     ORDER BY n.last_heard DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                )
+                    """
+                params: Tuple[Any, ...] = ()
+                if limit is not None and int(limit) > 0:
+                    query = f"{query}\nLIMIT ?"
+                    params = (int(limit),)
+                cursor.execute(query, params)
 
                 columns = [description[0] for description in cursor.description]
                 rows = cursor.fetchall()
@@ -1531,6 +1573,101 @@ class MeshtasticDatabase:
             return []
         except Exception as e:
             logger.error(f"Unexpected error getting latest positions: {e}")
+            return []
+
+    def get_nodes_with_latest_altitudes(
+        self, limit: int = 500
+    ) -> List[Dict[str, Any]]:
+        """Return nodes with their most recent altitude from positions or telemetry."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    WITH latest_positions AS (
+                        SELECT
+                            node_id,
+                            latitude,
+                            longitude,
+                            altitude,
+                            timestamp,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY node_id
+                                ORDER BY timestamp DESC
+                            ) as rn
+                        FROM positions
+                    ),
+                    latest_telemetry AS (
+                        SELECT
+                            node_id,
+                            latitude,
+                            longitude,
+                            altitude,
+                            timestamp,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY node_id
+                                ORDER BY timestamp DESC
+                            ) as rn
+                        FROM telemetry
+                        WHERE altitude IS NOT NULL
+                    )
+                    SELECT
+                        n.node_id,
+                        n.long_name,
+                        CASE
+                            WHEN lp.timestamp IS NULL THEN lt.latitude
+                            WHEN lt.timestamp IS NULL THEN lp.latitude
+                            WHEN lp.timestamp >= lt.timestamp THEN lp.latitude
+                            ELSE lt.latitude
+                        END AS latitude,
+                        CASE
+                            WHEN lp.timestamp IS NULL THEN lt.longitude
+                            WHEN lt.timestamp IS NULL THEN lp.longitude
+                            WHEN lp.timestamp >= lt.timestamp THEN lp.longitude
+                            ELSE lt.longitude
+                        END AS longitude,
+                        CASE
+                            WHEN lp.timestamp IS NULL THEN lt.altitude
+                            WHEN lt.timestamp IS NULL THEN lp.altitude
+                            WHEN lp.timestamp >= lt.timestamp THEN lp.altitude
+                            ELSE lt.altitude
+                        END AS altitude,
+                        CASE
+                            WHEN lp.timestamp IS NULL THEN lt.timestamp
+                            WHEN lt.timestamp IS NULL THEN lp.timestamp
+                            WHEN lp.timestamp >= lt.timestamp THEN lp.timestamp
+                            ELSE lt.timestamp
+                        END AS timestamp,
+                        CASE
+                            WHEN lp.timestamp IS NULL AND lt.timestamp IS NOT NULL THEN 'telemetry'
+                            WHEN lt.timestamp IS NULL AND lp.timestamp IS NOT NULL THEN 'position'
+                            WHEN lp.timestamp >= lt.timestamp THEN 'position'
+                            ELSE 'telemetry'
+                        END AS altitude_source
+                    FROM nodes n
+                    LEFT JOIN latest_positions lp
+                        ON n.node_id = lp.node_id AND lp.rn = 1
+                    LEFT JOIN latest_telemetry lt
+                        ON n.node_id = lt.node_id AND lt.rn = 1
+                    ORDER BY
+                        CASE
+                            WHEN lp.timestamp IS NULL THEN lt.timestamp
+                            WHEN lt.timestamp IS NULL THEN lp.timestamp
+                            WHEN lp.timestamp >= lt.timestamp THEN lp.timestamp
+                            ELSE lt.timestamp
+                        END DESC
+                    LIMIT ?
+                """,
+                    (limit,),
+                )
+                columns = [description[0] for description in cursor.description]
+                rows = cursor.fetchall()
+                return [dict(zip(columns, row)) for row in rows]
+        except sqlite3.Error as e:
+            logger.error(f"Database error getting latest altitudes: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Unexpected error getting latest altitudes: {e}")
             return []
 
     def get_network_topology(self) -> Dict[str, Any]:

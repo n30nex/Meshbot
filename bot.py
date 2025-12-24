@@ -57,6 +57,9 @@ def _configure_logging() -> logging.Logger:
             "format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
         )
         log_file = LOGGING_CONFIG.get("file", "bot.log")
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
         max_bytes = int(LOGGING_CONFIG.get("max_size", 10 * 1024 * 1024))
         backup_count = int(LOGGING_CONFIG.get("backup_count", 5))
     except Exception:
@@ -103,6 +106,26 @@ def format_utc_time(dt=None, format_str="%Y-%m-%d %H:%M:%S UTC"):
     if dt is None:
         dt = get_utc_time()
     return dt.strftime(format_str)
+
+def normalize_node_id(val: Any) -> Optional[str]:
+    """Normalize numeric or string node IDs to the !xxxxxxxx format."""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        if val.startswith("!"):
+            return val
+        try:
+            num = int(val, 0)
+        except Exception:
+            return val
+    else:
+        try:
+            num = int(val)
+        except Exception:
+            return None
+    if num <= 0:
+        return None
+    return f"!{num:08x}"
 
 
 # Cache decorator for expensive operations
@@ -336,6 +359,13 @@ class MeshtasticInterface:
                     else:
                         last_heard_str = None
 
+                    next_hop_raw = (
+                        node_data.get("nextHop")
+                        or node_data.get("next_hop")
+                        or node_data.get("nextHopId")
+                    )
+                    next_hop_id = normalize_node_id(next_hop_raw)
+
                     node_info = {
                         "node_id": str(node_id),
                         "node_num": node_data.get("num"),
@@ -352,6 +382,7 @@ class MeshtasticInterface:
                         "hops_away": node_data.get("hopsAway", 0),
                         "is_router": node_data.get("isRouter", False),
                         "is_client": node_data.get("isClient", True),
+                        "next_hop_node_id": next_hop_id,
                     }
 
                     # Store in database
@@ -946,7 +977,9 @@ class CommandHandler:
                 f"📍 No position data for **{target.get('long_name') or name}**.",
             )
             return
-        nodes = await self._run_db_query(self.database.get_all_nodes, timeout=10)
+        nodes = await self._run_db_query(
+            self.database.get_all_nodes, None, timeout=10
+        )
         results = []
         for n in nodes:
             if n.get("node_id") == target["node_id"]:
@@ -1144,17 +1177,21 @@ class CommandHandler:
         for attempt in range(retry_count):
             try:
                 # Run database operation in thread pool with timeout
+                start_time = time.monotonic()
                 result = await asyncio.wait_for(
                     asyncio.to_thread(func, *args, **kwargs), timeout=timeout
                 )
+                elapsed = time.monotonic() - start_time
 
                 # Record success
                 self._record_db_success()
 
                 # Log slow queries
-                if timeout > 5:
+                if elapsed >= 5:
                     logger.warning(
-                        f"Slow query completed: {func.__name__} took close to {timeout}s"
+                        "Slow query completed: %s took %.2fs",
+                        func.__name__,
+                        elapsed,
                     )
 
                 return result
@@ -2226,34 +2263,50 @@ Active Nodes: {summary.get("active_nodes", 0)}""",
             )
 
         if rows:
-            per_page = 40
-            total_pages = max(1, (len(rows) + per_page - 1) // per_page)
-            for page in range(total_pages):
-                slice_rows = rows[page * per_page : (page + 1) * per_page]
-                header = (
-                    f"{'ID':<6} | {'Name':<20} | {'Bat%':>5} | {'Volt':>6} | "
-                    f"{'Temp°C':>6} | {'Hum%':>5} | {'hPa':>6} | "
-                    f"{'Ch%':>5} | {'Air%':>5} | {'Uptime':>8} | {'Seen':>6}"
-                )
-                divider = "-" * len(header)
-                table_lines = [header, divider]
-                for r in slice_rows:
-                    line = (
-                        f"{r['id']:<6} | "
-                        f"{r['name']:<20} | "
-                        f"{r['bat']:>5} | "
-                        f"{r['volt']:>6} | "
-                        f"{r['temp']:>6} | "
-                        f"{r['humid']:>5} | "
-                        f"{r['press']:>6} | "
-                        f"{r['chan']:>5} | "
-                        f"{r['air']:>5} | "
-                        f"{r['uptime']:>8} | "
-                        f"{r['seen']:>6}"
-                    )
-                    table_lines.append(line)
+            header = (
+                f"{'ID':<6} | {'Name':<20} | {'Bat%':>5} | {'Volt':>6} | "
+                f"{'Temp°C':>6} | {'Hum%':>5} | {'hPa':>6} | "
+                f"{'Ch%':>5} | {'Air%':>5} | {'Uptime':>8} | {'Seen':>6}"
+            )
+            divider = "-" * len(header)
+            prefix = "```text\n"
+            suffix = "\n```"
+            max_chars = 1900
 
-                block = "```text\n" + "\n".join(table_lines) + "\n```"
+            def block_len(lines):
+                return len(prefix) + len(suffix) + sum(len(line) + 1 for line in lines)
+
+            table_lines = [header, divider]
+            current_len = block_len(table_lines)
+
+            for r in rows:
+                line = (
+                    f"{r['id']:<6} | "
+                    f"{r['name']:<20} | "
+                    f"{r['bat']:>5} | "
+                    f"{r['volt']:>6} | "
+                    f"{r['temp']:>6} | "
+                    f"{r['humid']:>5} | "
+                    f"{r['press']:>6} | "
+                    f"{r['chan']:>5} | "
+                    f"{r['air']:>5} | "
+                    f"{r['uptime']:>8} | "
+                    f"{r['seen']:>6}"
+                )
+                if (
+                    current_len + len(line) + 1 > max_chars
+                    and len(table_lines) > 2
+                ):
+                    block = prefix + "\n".join(table_lines) + suffix
+                    await message.channel.send(block)
+                    table_lines = [header, divider]
+                    current_len = block_len(table_lines)
+
+                table_lines.append(line)
+                current_len += len(line) + 1
+
+            if len(table_lines) > 2:
+                block = prefix + "\n".join(table_lines) + suffix
                 await message.channel.send(block)
 
     async def cmd_history(self, message: discord.Message):
@@ -2361,15 +2414,39 @@ Active Nodes: {summary.get("active_nodes", 0)}""",
         """Show bridge status"""
         # Check Meshtastic connection status safely
         meshtastic_status = "❌ Disconnected"
-        if self.meshtastic.iface:
+        last_rx_age = None
+        mesh_connected = False
+        if self.meshtastic and self.meshtastic.iface:
+            connected_flag = None
             try:
                 if hasattr(self.meshtastic.iface, "isConnected") and callable(
                     self.meshtastic.iface.isConnected
                 ):
-                    if self.meshtastic.iface.isConnected():
-                        meshtastic_status = "✅ Connected"
+                    connected_flag = bool(self.meshtastic.iface.isConnected())
             except Exception:
-                meshtastic_status = "❌ Disconnected"
+                connected_flag = None
+
+            try:
+                last_rx_age = time.time() - float(self._last_mesh_rx_time)
+            except Exception:
+                last_rx_age = None
+
+            if connected_flag is True:
+                mesh_connected = True
+            elif getattr(self.meshtastic.iface, "myInfo", None) is not None:
+                mesh_connected = True
+            elif last_rx_age is not None:
+                try:
+                    threshold = max(120, int(getattr(self, "_watchdog_threshold", 0) or 0))
+                except Exception:
+                    threshold = 120
+                if last_rx_age <= threshold:
+                    mesh_connected = True
+
+            if mesh_connected:
+                meshtastic_status = "✅ Connected"
+            else:
+                meshtastic_status = "⚠️ No recent packets"
 
         # Get database statistics
         try:
@@ -2424,6 +2501,21 @@ Active Nodes: {active_count}
 Current Time: {format_utc_time()}""",
             inline=True,
         )
+        if last_rx_age is not None:
+            try:
+                minutes = int(last_rx_age // 60)
+                if minutes < 60:
+                    age_text = f"{minutes}m"
+                else:
+                    hours = minutes // 60
+                    age_text = f"{hours}h"
+                embed.add_field(
+                    name="📶 **Mesh Activity**",
+                    value=f"Last Packet: {age_text} ago",
+                    inline=True,
+                )
+            except Exception:
+                pass
         # Presence summary
         embed.add_field(
             name="👥 **Presence**",
@@ -2433,7 +2525,7 @@ Current Time: {format_utc_time()}""",
 
         # System health
         health_score = 0
-        if meshtastic_status == "✅ Connected":
+        if mesh_connected:
             health_score += 50
         if node_count > 0:
             health_score += 30
@@ -2958,7 +3050,7 @@ Active Hours: {len(hourly_dist)}""",
         """Show node health leaderboards"""
         try:
             nodes = await self._get_cached_data(
-                "all_nodes", self.database.get_all_nodes
+                "all_nodes_full", self.database.get_all_nodes, None
             )
             if not nodes:
                 await self._safe_send(
@@ -4014,6 +4106,7 @@ Last Heard: {nodes[0].get("last_heard", "Unknown")}""",
         name_by_id: Dict[str, str] = {}
         hops_by_id: Dict[str, Optional[int]] = {}
         last_heard_by_id: Dict[str, Optional[str]] = {}
+        via_by_id: Dict[str, Optional[str]] = {}
         for node in nodes:
             node_id = str(node.get("node_id") or "")
             name = (
@@ -4029,6 +4122,10 @@ Last Heard: {nodes[0].get("last_heard", "Unknown")}""",
             except Exception:
                 hops_by_id[node_id] = None
             last_heard_by_id[node_id] = node.get("last_heard")
+            relay_id = normalize_node_id(node.get("last_relay_node_id"))
+            next_hop_id = normalize_node_id(node.get("next_hop_node_id"))
+            via_id = relay_id or next_hop_id
+            via_by_id[node_id] = via_id if via_id != node_id else None
 
         # Build adjacency from message-derived connections. Prefer to drop broadcast edges,
         # but if that leaves us empty, fall back to all edges so the view is never blank.
@@ -4153,7 +4250,7 @@ Last Heard: {nodes[0].get("last_heard", "Unknown")}""",
             for nid in hop_nodes:
                 name = name_by_id.get(nid, nid) or nid
                 short_id = nid[-4:] if len(nid) >= 4 else nid or "--"
-                parent = parent_for.get(nid)
+                parent = via_by_id.get(nid) or parent_for.get(nid)
                 edge = _edge_info(nid, parent) if parent else {}
                 msg = edge.get("message_count")
                 avg_h = edge.get("avg_hops")
@@ -5670,6 +5767,8 @@ class DiscordBot(discord.Client):
 
         # High altitude alert cooldown map: node_id -> last_alert_utc_str
         self._high_alt_alerts = {}
+        # Movement alert cooldown map: node_id -> last_alert_epoch
+        self._movement_alerts = {}
 
         # Restore persisted queues if configured
         self._load_persisted_queues()
@@ -5801,6 +5900,8 @@ class DiscordBot(discord.Client):
     async def on_message(self, message):
         """Handle incoming messages"""
         if message.author.id == self.user.id:
+            return
+        if message.channel is None or message.channel.id != self.config.channel_id:
             return
 
         # Handle ping/pong functionality
@@ -6188,7 +6289,7 @@ class DiscordBot(discord.Client):
     async def _process_nodes(self, channel):
         """Process and store nodes, announce new ones"""
         try:
-            result = self.meshtastic.process_nodes()
+            result = await asyncio.to_thread(self.meshtastic.process_nodes)
             if result and len(result) == 2:
                 processed_nodes, new_nodes = result
 
@@ -6336,11 +6437,25 @@ class DiscordBot(discord.Client):
         except Exception as e:
             logger.error(f"Error sending telemetry update: {e}")
 
+    def _sanitize_user_text(self, text: Optional[str]) -> str:
+        """Escape markdown and neutralize mention patterns in untrusted text."""
+        if text is None:
+            return ""
+        try:
+            safe_text = discord.utils.escape_markdown(str(text))
+        except Exception:
+            safe_text = str(text)
+        safe_text = safe_text.replace("@everyone", "@ everyone")
+        safe_text = safe_text.replace("@here", "@ here")
+        safe_text = safe_text.replace("<@", "< @")
+        return safe_text
+
     async def _process_mesh_to_discord(self, channel):
         """Process messages from mesh to Discord with improved error handling"""
         try:
             processed_count = 0
             max_batch_size = 10  # Process max 10 messages at once
+            allowed_mentions = discord.AllowedMentions.none()
 
             while not self.mesh_to_discord.empty() and processed_count < max_batch_size:
                 item = self.mesh_to_discord.get_nowait()
@@ -6348,11 +6463,14 @@ class DiscordBot(discord.Client):
                     if isinstance(item, dict):
                         if item.get("type") == "text":
                             # Format as single line message
-                            from_name = item.get(
+                            from_name_raw = item.get(
                                 "from_name", item.get("from_id", "Unknown")
                             )
-                            to_name = item.get("to_name", item.get("to_id", "Unknown"))
-                            text = str(item.get("text", ""))
+                            to_name_raw = item.get("to_name", item.get("to_id", "Unknown"))
+                            raw_text = str(item.get("text", ""))
+                            from_name = self._sanitize_user_text(from_name_raw)
+                            to_name = self._sanitize_user_text(to_name_raw)
+                            text = self._sanitize_user_text(raw_text)
                             hops = item.get("hops_away", 0)
 
                             # Validate message content
@@ -6376,19 +6494,23 @@ class DiscordBot(discord.Client):
                             if len(message_text) > 2000:
                                 message_text = message_text[:1997] + "..."
 
-                            await channel.send(message_text)
+                            await channel.send(
+                                message_text, allowed_mentions=allowed_mentions
+                            )
                             logger.info(
                                 f"📤 DISCORD: Sent message to Discord - '{text[:30]}{'...' if len(text) > 30 else ''}' from {from_name}"
                             )
-                            processed_count += 1
 
                         elif item.get("type") == "traceroute":
                             # Format traceroute information
-                            from_name = item.get(
+                            from_name_raw = item.get(
                                 "from_name", item.get("from_id", "Unknown")
                             )
-                            to_name = item.get("to_name", item.get("to_id", "Unknown"))
-                            route_text = item.get("route_text", "")
+                            to_name_raw = item.get("to_name", item.get("to_id", "Unknown"))
+                            route_text_raw = item.get("route_text", "")
+                            from_name = self._sanitize_user_text(from_name_raw)
+                            to_name = self._sanitize_user_text(to_name_raw)
+                            route_text = self._sanitize_user_text(route_text_raw)
                             hops_count = item.get("hops_count", 0)
 
                             # Create traceroute embed
@@ -6411,17 +6533,19 @@ class DiscordBot(discord.Client):
 
                             embed.set_footer(text=f"Traceroute completed at")
 
-                            await channel.send(embed=embed)
+                            await channel.send(
+                                embed=embed, allowed_mentions=allowed_mentions
+                            )
                             logger.info(
                                 f"🛣️ DISCORD: Sent traceroute info - {from_name} → {to_name} ({hops_count} hops)"
                             )
-                            processed_count += 1
 
                         elif item.get("type") == "movement":
                             # Format movement notification
-                            from_name = item.get(
+                            from_name_raw = item.get(
                                 "from_name", item.get("from_id", "Unknown")
                             )
+                            from_name = self._sanitize_user_text(from_name_raw)
                             distance_moved = item.get("distance_moved")
                             old_lat = item.get("old_lat", 0)
                             old_lon = item.get("old_lon", 0)
@@ -6529,16 +6653,23 @@ class DiscordBot(discord.Client):
                                 )
 
                             embed.set_footer(text=f"Movement detected at")
-                            await channel.send(embed=embed)
-                            logger.info(
-                                f"🚶 DISCORD: Sent movement notification - {from_name} moved {distance_moved:.1f}m"
+                            await channel.send(
+                                embed=embed, allowed_mentions=allowed_mentions
                             )
-                        processed_count += 1
+                            distance_label = "unknown"
+                            try:
+                                if distance_moved is not None:
+                                    distance_label = f"{float(distance_moved):.1f}m"
+                            except Exception:
+                                distance_label = "unknown"
+                            logger.info(
+                                f"🚶 DISCORD: Sent movement notification - {from_name} moved {distance_label}"
+                            )
 
                         # Special handling for ping messages - show pong response after a delay
                         if (
                             item.get("type") == "text"
-                            and item.get("text", "").strip().lower() == "ping"
+                            and raw_text.strip().lower() == "ping"
                         ):
                             # Wait a moment for the ping message to be displayed first
                             await asyncio.sleep(1.0)
@@ -6553,16 +6684,20 @@ class DiscordBot(discord.Client):
                             pong_embed.set_footer(
                                 text="🌍 UTC Time | Mesh network response"
                             )
-                            await channel.send(embed=pong_embed)
+                            await channel.send(
+                                embed=pong_embed, allowed_mentions=allowed_mentions
+                            )
                             logger.info(
                                 f"Pong response announced for ping from {from_name}"
                             )
 
                     else:
                         # Handle other message types
-                        message_text = f"📡 **Mesh Message:** {str(item)[:1900]}"
-                        await channel.send(message_text)
-                        processed_count += 1
+                        message_text = self._sanitize_user_text(str(item))
+                        message_text = f"📡 **Mesh Message:** {message_text[:1900]}"
+                        await channel.send(
+                            message_text, allowed_mentions=allowed_mentions
+                        )
 
                 except discord.HTTPException as e:
                     logger.error(f"Discord API error sending message: {e}")
@@ -6570,6 +6705,7 @@ class DiscordBot(discord.Client):
                 except Exception as e:
                     logger.error(f"Error processing individual mesh message: {e}")
                 finally:
+                    processed_count += 1
                     self.mesh_to_discord.task_done()
 
         except queue.Empty:
@@ -6663,6 +6799,15 @@ class DiscordBot(discord.Client):
                     self.database.update_last_heard(from_id, ts)
             except Exception as lh_err:
                 logger.error(f"Error updating last_heard for {from_id}: {lh_err}")
+
+            try:
+                if from_id and self.database:
+                    relay_raw = packet.get("relayNode") or packet.get("relay_node")
+                    relay_id = normalize_node_id(relay_raw)
+                    if relay_id and relay_id != from_id:
+                        self.database.update_last_relay(from_id, relay_id)
+            except Exception as relay_err:
+                logger.error(f"Error updating relay info for {from_id}: {relay_err}")
 
             # Get node display name for logging
             from_name = (
@@ -6960,14 +7105,19 @@ class DiscordBot(discord.Client):
             lat = pos_obj.get("latitude") or pos_obj.get("latitude_i")
             lon = pos_obj.get("longitude") or pos_obj.get("longitude_i")
             alt = pos_obj.get("altitude")
+            if alt is None:
+                alt = telemetry_data.get("altitude")
+            if alt is not None:
+                try:
+                    extracted_data["altitude"] = float(alt)
+                except Exception:
+                    pass
             if lat is not None and lon is not None:
                 try:
                     lat_f = float(lat) / (1e7 if "latitude_i" in pos_obj else 1.0)
                     lon_f = float(lon) / (1e7 if "longitude_i" in pos_obj else 1.0)
                     extracted_data["latitude"] = lat_f
                     extracted_data["longitude"] = lon_f
-                    if alt is not None:
-                        extracted_data["altitude"] = float(alt)
                 except Exception:
                     pass
 
@@ -7043,22 +7193,20 @@ class DiscordBot(discord.Client):
             from_id = packet.get("fromId", "Unknown")
             to_id = packet.get("toId", "Primary")
             decoded = packet.get("decoded", {})
+            from_name = (
+                self.database.get_node_display_name(from_id)
+                if self.database
+                else from_id
+            )
+            to_name = (
+                self.database.get_node_display_name(to_id)
+                if self.database
+                else to_id
+            )
 
             # Check if this is a RouteDiscovery packet
             if "routing" in decoded and "routeDiscovery" in decoded["routing"]:
                 route_data = decoded["routing"]["routeDiscovery"]
-
-                # Get node display names
-                from_name = (
-                    self.database.get_node_display_name(from_id)
-                    if self.database
-                    else from_id
-                )
-                to_name = (
-                    self.database.get_node_display_name(to_id)
-                    if self.database
-                    else to_id
-                )
 
                 # Extract route information
                 route = route_data.get("route", [])
@@ -7264,6 +7412,11 @@ class DiscordBot(discord.Client):
         """Process position packet and detect movement"""
         try:
             from_id = packet.get("fromId", "Unknown")
+            if not from_id or from_id == "Unknown":
+                logger.warning(
+                    f"Skipping position packet with invalid fromId: {from_id}"
+                )
+                return
             decoded = packet.get("decoded", {})
             position_data = decoded.get("position", {}) or {}
 
@@ -7314,6 +7467,44 @@ class DiscordBot(discord.Client):
             heading_val = position_data.get("ground_track")
             if heading_val is None:
                 heading_val = position_data.get("groundTrack")
+            precision_bits = position_data.get("precision_bits")
+            if precision_bits is None:
+                precision_bits = position_data.get("precisionBits")
+
+            try:
+                from config import MOVEMENT_DETECTION
+
+                movement_threshold = float(
+                    MOVEMENT_DETECTION.get("distance_threshold_m", 100.0)
+                )
+                speed_threshold = float(
+                    MOVEMENT_DETECTION.get("speed_threshold_mps", 3.0)
+                )
+                speed_distance_floor = float(
+                    MOVEMENT_DETECTION.get("speed_distance_floor_m", 25.0)
+                )
+                jitter_floor = float(
+                    MOVEMENT_DETECTION.get("jitter_floor_m", 15.0)
+                )
+                min_interval_seconds = float(
+                    MOVEMENT_DETECTION.get("min_interval_seconds", 15)
+                )
+                alert_cooldown_seconds = float(
+                    MOVEMENT_DETECTION.get("alert_cooldown_seconds", 300)
+                )
+            except Exception:
+                movement_threshold = 100.0
+                speed_threshold = 3.0
+                speed_distance_floor = 25.0
+                jitter_floor = 15.0
+                min_interval_seconds = 15.0
+                alert_cooldown_seconds = 300.0
+
+            try:
+                if precision_bits is not None and float(precision_bits) < 20:
+                    jitter_floor = max(jitter_floor, 50.0)
+            except Exception:
+                pass
 
             # Skip if coordinates are invalid
             if new_lat is None or new_lon is None:
@@ -7329,6 +7520,13 @@ class DiscordBot(discord.Client):
                 old_lat: Optional[float],
                 old_lon: Optional[float],
             ):
+                if alert_cooldown_seconds and alert_cooldown_seconds > 0:
+                    now_ts = time.time()
+                    last_alert = self._movement_alerts.get(from_id)
+                    if last_alert and (now_ts - last_alert) < alert_cooldown_seconds:
+                        return
+                    self._movement_alerts[from_id] = now_ts
+
                 from_name = (
                     self.database.get_node_display_name(from_id)
                     if self.database
@@ -7393,41 +7591,100 @@ class DiscordBot(discord.Client):
 
             # Get last known position from database
             if self.database:
+                def _parse_ts(value: Optional[str]) -> Optional[datetime]:
+                    if not value:
+                        return None
+                    try:
+                        return datetime.fromisoformat(
+                            str(value).replace("Z", "+00:00")
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        return None
+
                 last_position = self.database.get_last_position(from_id)
 
                 last_lat = None
                 last_lon = None
                 distance_moved = None
                 movement_notified = False
+                elapsed_seconds = None
+                new_ts = None
+
+                packet_time = position_data.get("time") or position_data.get(
+                    "timestamp"
+                )
+                if packet_time is not None:
+                    try:
+                        if isinstance(packet_time, (int, float)):
+                            new_ts = datetime.utcfromtimestamp(float(packet_time))
+                        else:
+                            new_ts = _parse_ts(packet_time)
+                    except Exception:
+                        new_ts = None
+                if new_ts is None:
+                    new_ts = datetime.utcnow()
 
                 if last_position:
                     last_lat = last_position.get("latitude", 0)
                     last_lon = last_position.get("longitude", 0)
+                    last_ts = _parse_ts(last_position.get("timestamp"))
+                    if last_ts is not None:
+                        elapsed_seconds = max(
+                            0.0, (new_ts - last_ts).total_seconds()
+                        )
 
                     # Calculate distance moved
-                    if last_lat != 0 and last_lon != 0:
+                    if (
+                        last_lat != 0
+                        and last_lon != 0
+                        and (
+                            elapsed_seconds is None
+                            or elapsed_seconds >= min_interval_seconds
+                        )
+                    ):
                         distance_moved = self.calculate_distance(
                             last_lat, last_lon, new_lat, new_lon
                         )
 
-                        # Movement threshold: 100 meters (configurable)
-                        movement_threshold = 100.0
+                        if (
+                            distance_moved is not None
+                            and distance_moved < jitter_floor
+                        ):
+                            distance_moved = None
 
-                        if distance_moved > movement_threshold:
+                        if distance_moved is not None and distance_moved >= movement_threshold:
                             enqueue_movement(
-                                distance_moved, speed_mps, last_lat, last_lon
+                                distance_moved,
+                                speed_mps,
+                                last_lat,
+                                last_lon,
                             )
                             movement_notified = True
+
+                effective_speed = speed_mps
+                if (
+                    effective_speed is None
+                    and distance_moved is not None
+                    and elapsed_seconds
+                    and elapsed_seconds > 0
+                ):
+                    effective_speed = distance_moved / elapsed_seconds
 
                 # Speed-only trigger if node is reporting movement but hasn't crossed distance threshold
                 if (
                     not movement_notified
-                    and speed_mps is not None
-                    and speed_mps > 1.0
+                    and effective_speed is not None
+                    and effective_speed >= speed_threshold
+                    and distance_moved is not None
+                    and distance_moved >= speed_distance_floor
                 ):
                     enqueue_movement(
-                        distance_moved if distance_moved is not None else 0.0,
-                        speed_mps,
+                        distance_moved,
+                        speed_mps if speed_mps is not None else effective_speed,
                         last_lat,
                         last_lon,
                     )
@@ -7480,15 +7737,21 @@ class DiscordBot(discord.Client):
                     cooldown_min = 180
 
                 if self.database and channel:
-                    nodes = await asyncio.to_thread(
-                        self.database.get_nodes_with_latest_positions, 500
-                    )
+                    if hasattr(self.database, "get_nodes_with_latest_altitudes"):
+                        nodes = await asyncio.to_thread(
+                            self.database.get_nodes_with_latest_altitudes, 500
+                        )
+                    else:
+                        nodes = await asyncio.to_thread(
+                            self.database.get_nodes_with_latest_positions, 500
+                        )
                     for n in nodes:
                         node_id = n.get("node_id")
                         if not node_id:
                             continue
                         long_name = n.get("long_name") or node_id
                         altitude = n.get("altitude")
+                        altitude_source = n.get("altitude_source")
                         if altitude is None:
                             continue
                         if isinstance(altitude, str):
@@ -7521,6 +7784,12 @@ class DiscordBot(discord.Client):
                                     value=f"{altitude:.0f}",
                                     inline=True,
                                 )
+                                if altitude_source:
+                                    embed.add_field(
+                                        name="Source",
+                                        value=str(altitude_source).title(),
+                                        inline=True,
+                                    )
                                 ts = n.get("timestamp")
                                 if ts:
                                     embed.add_field(

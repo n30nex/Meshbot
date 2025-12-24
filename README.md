@@ -1,8 +1,8 @@
-# Meshtastic Discord Bridge Bot – v2.0
+# Meshtastic Discord Bridge Bot – v2.6
 
 Docker-first bridge between Meshtastic and Discord, with telemetry, locations, and topology views.
 
-## What’s new in 2.0
+## What’s new in 2.6
 - Docker workflow by default; local scripts removed.
 - Paginated `$nodes` / `$activenodes` with optional nearest-city lookup (configurable).
 - Rich telemetry: `$telem` shows per-node table (battery, voltage, temp, humidity, pressure, channel/air util, uptime, seen) plus summary.

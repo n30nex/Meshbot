@@ -1,7 +1,7 @@
-# Big Phat Update v2.5 Plan
+# Big Phat Update v2.6 Plan
 
 ## Goals
-- Ship the requested v2.5 feature set with minimal disruption.
+- Ship the requested v2.6 feature set with minimal disruption.
 - Keep changes incremental and testable.
 - Prefer DB-backed data for analytics and summaries.
 
