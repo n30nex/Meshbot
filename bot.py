@@ -3,7 +3,10 @@ import asyncio
 import os
 import sys
 import io
+import json
+import hashlib
 import logging
+from logging.handlers import RotatingFileHandler
 import threading
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
@@ -14,19 +17,77 @@ import meshtastic.tcp_interface
 import meshtastic.serial_interface
 import queue
 import time
+import requests
+from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from database import MeshtasticDatabase
 import functools
 import weakref
-from config import BOT_CONFIG, LOGGING_CONFIG
+from config import (
+    BOT_CONFIG,
+    LOGGING_CONFIG,
+    HEALTH_SCORE,
+    MAP_SNAPSHOT,
+    QUEUE_PERSISTENCE,
+    DB_MAINTENANCE,
+)
+
+class JsonFormatter(logging.Formatter):
+    """Simple JSON formatter for structured logs."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "line": record.lineno,
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=True)
+
+def _configure_logging() -> logging.Logger:
+    """Configure application logging with rotation."""
+    try:
+        level_name = str(LOGGING_CONFIG.get("level", "INFO")).upper()
+        log_level = getattr(logging, level_name, logging.INFO)
+        log_format = LOGGING_CONFIG.get(
+            "format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        log_file = LOGGING_CONFIG.get("file", "bot.log")
+        max_bytes = int(LOGGING_CONFIG.get("max_size", 10 * 1024 * 1024))
+        backup_count = int(LOGGING_CONFIG.get("backup_count", 5))
+    except Exception:
+        log_level = logging.INFO
+        log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        log_file = "bot.log"
+        max_bytes = 10 * 1024 * 1024
+        backup_count = 5
+
+    handlers = [
+        RotatingFileHandler(
+            log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+        ),
+        logging.StreamHandler(sys.stdout),
+    ]
+
+    structured = bool(LOGGING_CONFIG.get("structured", False))
+    if structured:
+        formatter = JsonFormatter()
+    else:
+        formatter = logging.Formatter(log_format)
+    for handler in handlers:
+        handler.setFormatter(formatter)
+
+    logging.basicConfig(level=log_level, handlers=handlers, force=True)
+    logging.captureWarnings(True)
+    return logging.getLogger(__name__)
+
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()],
-)
-logger = logging.getLogger(__name__)
+logger = _configure_logging()
 
 # Load environment variables
 load_dotenv()
@@ -90,6 +151,7 @@ class Config:
     discord_token: str
     channel_id: int
     meshtastic_hostname: Optional[str]
+    meshtastic_serial_port: Optional[str] = BOT_CONFIG.get("meshtastic_serial_port")
     message_max_length: int = BOT_CONFIG["message_max_length"]
     node_refresh_interval: int = BOT_CONFIG["node_refresh_interval"]
     active_node_threshold: int = BOT_CONFIG[
@@ -101,6 +163,12 @@ class Config:
     presence_hysteresis_factor: float = BOT_CONFIG.get(
         "presence_hysteresis_factor", 2.0
     )
+    presence_announcements_enabled: bool = BOT_CONFIG.get(
+        "presence_announcements_enabled", True
+    )
+    connection_watchdog_minutes: int = BOT_CONFIG.get(
+        "connection_watchdog_minutes", 10
+    )
 
 
 class MeshtasticInterface:
@@ -110,11 +178,13 @@ class MeshtasticInterface:
         self,
         hostname: Optional[str] = None,
         database: Optional[MeshtasticDatabase] = None,
+        serial_port: Optional[str] = None,
     ):
         self.hostname = hostname
         self.iface = None  # Changed to match reference implementation
         self.database = database
         self.last_node_refresh = 0
+        self.serial_port = serial_port
 
     async def connect(self) -> bool:
         """Connect to Meshtastic radio"""
@@ -123,8 +193,45 @@ class MeshtasticInterface:
                 logger.info(f"Connecting to Meshtastic via TCP: {self.hostname}")
                 self.iface = meshtastic.tcp_interface.TCPInterface(self.hostname)
             else:
-                logger.info("Connecting to Meshtastic via Serial")
-                self.iface = meshtastic.serial_interface.SerialInterface()
+                if self.serial_port:
+                    serial_path = self.serial_port
+                    if os.path.isdir(serial_path):
+                        try:
+                            entries = sorted(
+                                e
+                                for e in os.listdir(serial_path)
+                                if not e.startswith(".")
+                            )
+                            if entries:
+                                serial_path = os.path.join(serial_path, entries[0])
+                                logger.info(
+                                    f"Connecting to Meshtastic via Serial device {serial_path}"
+                                )
+                            else:
+                                logger.warning(
+                                    f"Serial port directory {serial_path} is empty; falling back to default"
+                                )
+                                serial_path = None
+                        except Exception as list_err:
+                            logger.warning(
+                                f"Failed to read serial port directory {serial_path}: {list_err}"
+                            )
+                            serial_path = None
+                    elif not os.path.exists(serial_path):
+                        logger.warning(
+                            f"Serial port {serial_path} not found; falling back to default"
+                        )
+                        serial_path = None
+                    if serial_path:
+                        self.iface = meshtastic.serial_interface.SerialInterface(
+                            devPath=serial_path
+                        )
+                    else:
+                        logger.info("Connecting to Meshtastic via Serial")
+                        self.iface = meshtastic.serial_interface.SerialInterface()
+                else:
+                    logger.info("Connecting to Meshtastic via Serial")
+                    self.iface = meshtastic.serial_interface.SerialInterface()
 
             # Wait for connection
             await asyncio.sleep(2)
@@ -382,11 +489,22 @@ class CommandHandler:
             "$send": self.cmd_send_node,  # Changed to use fuzzy name matching
             "$activenodes": self.cmd_active_nodes,
             "$nodes": self.cmd_all_nodes,
+            "$node": self.cmd_node,
             "$telem": self.cmd_telemetry,
+            "$history": self.cmd_history,
+            "$dbhealth": self.cmd_dbhealth,
             "$status": self.cmd_status,
             "$topo": self.cmd_topology_tree,
+            "$trace": self.cmd_trace_route,
+            "$leaderboard": self.cmd_leaderboard,
+            "$msgstats": self.cmd_message_statistics,
+            "$netart": self.cmd_network_art,
+            "$live": self.cmd_live_monitor,
             "$where": self.cmd_where,
             "$nearest": self.cmd_nearest,
+            "$otm": self.cmd_otm,
+            "$loglevel": self.cmd_loglevel,
+            "$uptime": self.cmd_uptime,
         }
 
         # Apply command aliases defined in config.  The config.COMMAND_ALIASES
@@ -411,6 +529,183 @@ class CommandHandler:
         except Exception as alias_error:
             logger.debug(f"Failed to apply command aliases: {alias_error}")
 
+        self.command_help = {
+            "$help": {
+                "summary": "Show help or command details",
+                "usage": "$help [command]",
+                "details": "Use without args to list commands, or pass a command for details.",
+                "examples": ["$help", "$help $node"],
+                "category": "Core",
+            },
+            "$txt": {
+                "summary": "Send a message to the mesh",
+                "usage": "$txt <message>",
+                "details": f"Max length {BOT_CONFIG.get('message_max_length', 225)} chars.",
+                "examples": ["$txt Hello mesh!"],
+                "category": "Core",
+            },
+            "$send": {
+                "summary": "Send a message to a specific node",
+                "usage": "$send <longname> <message>",
+                "details": "Fuzzy-matches node names.",
+                "examples": ["$send Rover-1 Telemetry check"],
+                "category": "Core",
+            },
+            "$status": {
+                "summary": "Bridge status overview",
+                "usage": "$status",
+                "details": "Shows Discord + Meshtastic connectivity and node counts.",
+                "examples": ["$status"],
+                "category": "Core",
+            },
+            "$uptime": {
+                "summary": "Uptime + queue health",
+                "usage": "$uptime",
+                "details": "Shows uptime and queue backlog.",
+                "examples": ["$uptime"],
+                "category": "Core",
+            },
+            "$nodes": {
+                "summary": "List all known nodes",
+                "usage": "$nodes",
+                "details": "Paged node list with latest telemetry.",
+                "examples": ["$nodes"],
+                "category": "Nodes",
+            },
+            "$activenodes": {
+                "summary": "List recently active nodes",
+                "usage": "$activenodes",
+                "details": f"Active threshold: {BOT_CONFIG.get('active_node_threshold', 60)} minutes.",
+                "examples": ["$activenodes"],
+                "category": "Nodes",
+            },
+            "$node": {
+                "summary": "Node profile card",
+                "usage": "$node <name>",
+                "details": "Shows latest telemetry, last message, and trend snippets.",
+                "examples": ["$node rover"],
+                "category": "Nodes",
+            },
+            "$where": {
+                "summary": "Latest location for a node",
+                "usage": "$where <name>",
+                "details": "Uses the most recent position data.",
+                "examples": ["$where base"],
+                "category": "Nodes",
+            },
+            "$nearest": {
+                "summary": "Nearest nodes to a node",
+                "usage": "$nearest <name>",
+                "details": "Ranks nodes by geographic distance.",
+                "examples": ["$nearest rover"],
+                "category": "Nodes",
+            },
+            "$telem": {
+                "summary": "Telemetry summary",
+                "usage": "$telem",
+                "details": "Latest telemetry per node with summary stats.",
+                "examples": ["$telem"],
+                "category": "Telemetry",
+            },
+            "$history": {
+                "summary": "Metric history for a node",
+                "usage": "$history <node> <metric> [--spark]",
+                "details": "Use --spark for a compact sparkline.",
+                "examples": ["$history rover battery_level --spark"],
+                "category": "Telemetry",
+            },
+            "$dbhealth": {
+                "summary": "Database health snapshot",
+                "usage": "$dbhealth",
+                "details": "Counts and last timestamps per table.",
+                "examples": ["$dbhealth"],
+                "category": "Telemetry",
+            },
+            "$topo": {
+                "summary": "Network topology tree",
+                "usage": "$topo",
+                "details": "Builds a hop-aware ASCII topology map.",
+                "examples": ["$topo"],
+                "category": "Network",
+            },
+            "$trace": {
+                "summary": "Trace route to a node",
+                "usage": "$trace <name>",
+                "details": "Uses recent message routing data to infer hops.",
+                "examples": ["$trace rover"],
+                "category": "Network",
+            },
+            "$leaderboard": {
+                "summary": "Health score leaderboards",
+                "usage": "$leaderboard",
+                "details": "Ranks nodes by health score and activity.",
+                "examples": ["$leaderboard"],
+                "category": "Analytics",
+            },
+            "$msgstats": {
+                "summary": "Message statistics",
+                "usage": "$msgstats",
+                "details": "24h message stats and activity pattern.",
+                "examples": ["$msgstats"],
+                "category": "Analytics",
+            },
+            "$live": {
+                "summary": "Live packet monitor",
+                "usage": "$live",
+                "details": "Toggles live mesh packet updates for 1 minute.",
+                "examples": ["$live"],
+                "category": "Live",
+            },
+            "$netart": {
+                "summary": "ASCII network art",
+                "usage": "$netart",
+                "details": "Fun ASCII snapshot of the mesh.",
+                "examples": ["$netart"],
+                "category": "Live",
+            },
+            "$otm": {
+                "summary": "Movement trail summary",
+                "usage": "$otm <name>",
+                "details": "Summarizes recent movement and trail points.",
+                "examples": ["$otm rover"],
+                "category": "Live",
+            },
+            "$loglevel": {
+                "summary": "Change log verbosity at runtime",
+                "usage": "$loglevel <level>",
+                "details": "Levels: DEBUG, INFO, WARNING, ERROR, CRITICAL.",
+                "examples": ["$loglevel INFO"],
+                "category": "Admin",
+            },
+        }
+
+        self._help_categories = {
+            "Core": ["$help", "$txt", "$send", "$status", "$uptime"],
+            "Nodes": ["$nodes", "$activenodes", "$node", "$where", "$nearest"],
+            "Telemetry": ["$telem", "$history", "$dbhealth"],
+            "Network": ["$topo", "$trace"],
+            "Analytics": ["$leaderboard", "$msgstats"],
+            "Live": ["$live", "$netart", "$otm"],
+            "Admin": ["$loglevel"],
+        }
+
+        self._help_lookup = {}
+        for cmd in self.command_help.keys():
+            self._help_lookup[cmd] = cmd
+            self._help_lookup[cmd.lower()] = cmd
+        try:
+            from config import COMMAND_ALIASES
+
+            for alias, canonical in COMMAND_ALIASES.items():
+                if canonical in self.command_help:
+                    self._help_lookup[alias] = canonical
+                    self._help_lookup[alias.lower()] = canonical
+                elif alias in self.command_help:
+                    self._help_lookup[canonical] = alias
+                    self._help_lookup[canonical.lower()] = alias
+        except Exception as alias_error:
+            logger.debug(f"Failed to build help aliases: {alias_error}")
+
         # Cache for frequently accessed data
         self._node_cache = {}
         self._cache_timestamps = {}
@@ -426,6 +721,9 @@ class CommandHandler:
         self._packet_buffer = []  # Store recent packets for live display
         self._max_packet_buffer = 50  # Keep last 50 packets
         self._packet_buffer_lock = threading.Lock()  # Thread safety for packet buffer
+        self.mesh_to_discord_queue: Optional[queue.Queue] = None
+        self._start_time = time.time()
+        self._geo_cache: Dict[str, str] = {}
 
         # Circuit breaker for database operations
         self._circuit_breaker = {
@@ -462,7 +760,9 @@ class CommandHandler:
         # Update cooldown (only after successful command execution)
         # We'll move this to after the command is executed
 
-        for cmd, handler in self.commands.items():
+        for cmd, handler in sorted(
+            self.commands.items(), key=lambda item: len(item[0]), reverse=True
+        ):
             if content.startswith(cmd):
                 try:
                     await handler(message)
@@ -601,6 +901,25 @@ class CommandHandler:
                 pass
         if ts:
             embed.add_field(name="Last Update", value=str(ts), inline=True)
+        map_payload = None
+        if lat is not None and lon is not None:
+            try:
+                lat_f = float(lat)
+                lon_f = float(lon)
+                map_payload = await self._get_map_snapshot(lat_f, lon_f)
+                if map_payload and map_payload.get("url"):
+                    embed.set_image(url=map_payload["url"])
+            except Exception:
+                map_payload = None
+        if map_payload and map_payload.get("path"):
+            filename = os.path.basename(map_payload["path"])
+            try:
+                file_obj = discord.File(map_payload["path"], filename=filename)
+                embed.set_image(url=f"attachment://{filename}")
+                await message.channel.send(embed=embed, file=file_obj)
+                return
+            except Exception:
+                pass
         await message.channel.send(embed=embed)
 
     async def cmd_nearest(self, message: discord.Message):
@@ -660,6 +979,107 @@ class CommandHandler:
         await self._send_long_message(
             message.channel, "📍 Nearest nodes:\n" + "\n".join(lines)
         )
+
+    async def cmd_otm(self, message: discord.Message):
+        """Movement trail summary: $otm <name>"""
+        parts = message.content.strip().split(maxsplit=1)
+        if len(parts) < 2:
+            await self._safe_send(message.channel, "Use: `$otm <node_name>`")
+            return
+        name = parts[1].strip()
+        node = await self._run_db_query(
+            self.database.find_node_by_name, name, timeout=5
+        )
+        if not node:
+            await self._safe_send(
+                message.channel, f"❌ No node found matching '{name}'."
+            )
+            return
+        node_id = node.get("node_id")
+        history = await self._run_db_query(
+            self.database.get_position_history, node_id, 24, 200, timeout=10
+        )
+        if not history or len(history) < 2:
+            await self._safe_send(
+                message.channel,
+                f"📍 Not enough position history for **{node.get('long_name') or node_id}**.",
+            )
+            return
+
+        points = []
+        for entry in history:
+            lat = entry.get("latitude")
+            lon = entry.get("longitude")
+            ts = entry.get("timestamp")
+            dt = self._parse_timestamp(ts) if isinstance(ts, str) else None
+            if lat is None or lon is None or dt is None:
+                continue
+            try:
+                points.append((dt, float(lat), float(lon), entry))
+            except Exception:
+                continue
+        if len(points) < 2:
+            await self._safe_send(
+                message.channel,
+                f"📍 Not enough valid trail points for **{node.get('long_name') or node_id}**.",
+            )
+            return
+
+        points.sort(key=lambda item: item[0])
+        total_distance = 0.0
+        for idx in range(1, len(points)):
+            total_distance += self._haversine_m(
+                points[idx - 1][1],
+                points[idx - 1][2],
+                points[idx][1],
+                points[idx][2],
+            )
+
+        straight_line = self._haversine_m(
+            points[0][1], points[0][2], points[-1][1], points[-1][2]
+        )
+        duration_seconds = (points[-1][0] - points[0][0]).total_seconds()
+        avg_speed = (
+            total_distance / duration_seconds if duration_seconds > 0 else 0.0
+        )
+
+        embed = discord.Embed(
+            title="🧭 On The Move",
+            description=f"**{node.get('long_name') or node_id}** trail summary",
+            color=0x2ECC71,
+            timestamp=get_utc_time(),
+        )
+        embed.add_field(
+            name="Trail Summary",
+            value=(
+                f"Samples: {len(points)}\n"
+                f"Window: {points[0][0].strftime('%Y-%m-%d %H:%M')} → {points[-1][0].strftime('%Y-%m-%d %H:%M')}\n"
+                f"Total distance: {total_distance/1000:.2f} km\n"
+                f"Straight-line: {straight_line/1000:.2f} km\n"
+                f"Avg speed: {avg_speed*3.6:.2f} km/h"
+            ),
+            inline=False,
+        )
+
+        tail_lines = []
+        for dt, lat, lon, entry in points[-5:]:
+            alt = entry.get("altitude")
+            alt_text = ""
+            if alt is not None:
+                try:
+                    alt_text = f", {float(alt):.0f}m"
+                except Exception:
+                    alt_text = ""
+            tail_lines.append(
+                f"{dt.strftime('%H:%M')} - {lat:.5f}, {lon:.5f}{alt_text}"
+            )
+        embed.add_field(
+            name="Recent Trail Points",
+            value="\n".join(tail_lines),
+            inline=False,
+        )
+
+        await message.channel.send(embed=embed)
 
     def _check_circuit_breaker(self):
         """Check if circuit breaker allows database operations"""
@@ -772,6 +1192,31 @@ class CommandHandler:
         # All retries failed
         logger.error(f"All retries exhausted for {func.__name__}: {last_exception}")
         return None
+
+    def _enqueue_discord_message(self, payload: str) -> bool:
+        """Enqueue a Discord-originated payload to mesh with drop-oldest policy."""
+        try:
+            self.discord_to_mesh.put_nowait(payload)
+            return True
+        except queue.Full:
+            try:
+                dropped = self.discord_to_mesh.get_nowait()
+                preview = (
+                    f"{dropped[:50]}..."
+                    if isinstance(dropped, str) and len(dropped) > 50
+                    else str(dropped)
+                )
+                logger.warning(
+                    f"Discord→mesh queue full, dropped oldest entry: {preview}"
+                )
+                self.discord_to_mesh.put_nowait(payload)
+                return True
+            except queue.Empty:
+                logger.warning("Discord→mesh queue full and no entries to drop")
+                return False
+        except Exception as e:
+            logger.error(f"Error enqueuing Discord→mesh payload: {e}")
+            return False
 
     def add_packet_to_buffer(self, packet_info: dict):
         """Add packet information to the live monitor buffer (thread-safe)"""
@@ -952,6 +1397,39 @@ class CommandHandler:
 
     async def cmd_help(self, message: discord.Message):
         """Show help information"""
+        parts = message.content.strip().split(maxsplit=1)
+        if len(parts) > 1:
+            query = parts[1].strip()
+            if not query.startswith("$"):
+                query = f"${query}"
+            canonical = self._help_lookup.get(query) or self._help_lookup.get(
+                query.lower()
+            )
+            if not canonical or canonical not in self.command_help:
+                await self._safe_send(
+                    message.channel,
+                    f"❌ Unknown command `{query}`. Try `$help` to list commands.",
+                )
+                return
+            meta = self.command_help[canonical]
+            embed = discord.Embed(
+                title=f"🤖 Help: {canonical}",
+                description=meta.get("summary", "Command help"),
+                color=0x00FF00,
+                timestamp=get_utc_time(),
+            )
+            embed.add_field(name="Usage", value=f"`{meta.get('usage', canonical)}`")
+            details = meta.get("details")
+            if details:
+                embed.add_field(name="Details", value=details, inline=False)
+            examples = meta.get("examples", [])
+            if examples:
+                example_text = "\n".join(f"`{ex}`" for ex in examples[:5])
+                embed.add_field(name="Examples", value=example_text, inline=False)
+            embed.set_footer(text="🌍 UTC Time")
+            await message.channel.send(embed=embed)
+            return
+
         embed = discord.Embed(
             title="🤖 Meshtastic Discord Bridge Commands",
             description="Complete command reference for the mesh network bridge",
@@ -963,24 +1441,100 @@ class CommandHandler:
         )
         embed.set_footer(text="🌍 UTC Time | Use $help <command> for detailed info")
 
-        # Core Commands
-        embed.add_field(
-            name="📡 **Core Commands**",
-            value=f"""`$help` - Show this help
-`$txt <message>` - Send to mesh (max {BOT_CONFIG["message_max_length"]} chars)
-`$send <longname> <message>` - Send to a specific node
-`$activenodes` - Nodes active in last {BOT_CONFIG["active_node_threshold"]} minutes
-`$nodes` - List all known nodes
-`$telem` - Telemetry summary
-`$status` - Bridge status
-`$topo` - Visual tree of radio connections
-`$where <name>` - Latest location of a node
-`$nearest <name>` - Nearest nodes to a node
-`ping` - Mesh connectivity test""",
-            inline=False,
-        )
+        for category, commands in self._help_categories.items():
+            lines = []
+            for cmd in commands:
+                meta = self.command_help.get(cmd)
+                if not meta:
+                    continue
+                summary = meta.get("summary", "")
+                lines.append(f"`{cmd}` - {summary}")
+            if lines:
+                embed.add_field(
+                    name=f"{category} Commands",
+                    value="\n".join(lines)[:1024],
+                    inline=False,
+                )
 
         await message.channel.send(embed=embed)
+
+    async def cmd_uptime(self, message: discord.Message):
+        """Show bot uptime and queue health."""
+        uptime_seconds = max(0, time.time() - self._start_time)
+        uptime_text = str(timedelta(seconds=int(uptime_seconds)))
+
+        outbound_size = self.discord_to_mesh.qsize()
+        outbound_capacity = self.discord_to_mesh.maxsize or "∞"
+
+        if self.mesh_to_discord_queue:
+            inbound_size = self.mesh_to_discord_queue.qsize()
+            inbound_capacity = self.mesh_to_discord_queue.maxsize or "∞"
+            inbound_value = f"{inbound_size}/{inbound_capacity}"
+        else:
+            inbound_value = "N/A"
+
+        last_refresh = getattr(self.meshtastic, "last_node_refresh", 0) or 0
+        if last_refresh:
+            refresh_age = max(0, time.time() - last_refresh)
+            refresh_text = f"{int(refresh_age)}s ago"
+        else:
+            refresh_text = "Not yet"
+
+        try:
+            iface_ok = (
+                self.meshtastic.iface.isConnected()
+                if self.meshtastic.iface and hasattr(self.meshtastic.iface, "isConnected")
+                else False
+            )
+            iface_status = "Connected" if iface_ok else "Disconnected"
+        except Exception:
+            iface_status = "Unknown"
+
+        embed = discord.Embed(
+            title="\u23f1\ufe0f Bridge Uptime & Queues",
+            color=0x00BFFF,
+            timestamp=get_utc_time(),
+        )
+        embed.add_field(name="Uptime", value=uptime_text, inline=True)
+        embed.add_field(
+            name="Discord \u2192 Mesh", value=f"{outbound_size}/{outbound_capacity}", inline=True
+        )
+        embed.add_field(name="Mesh \u2192 Discord", value=inbound_value, inline=True)
+        embed.add_field(name="Last Node Refresh", value=refresh_text, inline=True)
+        embed.add_field(name="Interface", value=iface_status, inline=True)
+
+        await message.channel.send(embed=embed)
+
+    async def cmd_loglevel(self, message: discord.Message):
+        """Change runtime log level."""
+        parts = message.content.strip().split(maxsplit=1)
+        if not self._is_admin(message):
+            await self._safe_send(
+                message.channel,
+                "❌ You don't have permission to change log levels.",
+            )
+            return
+        if len(parts) < 2:
+            current = logging.getLogger().getEffectiveLevel()
+            await self._safe_send(
+                message.channel,
+                f"Use: `$loglevel <level>` (current: {logging.getLevelName(current)})",
+            )
+            return
+        level_name = parts[1].strip().upper()
+        if not hasattr(logging, level_name):
+            await self._safe_send(
+                message.channel,
+                "❌ Invalid level. Use DEBUG, INFO, WARNING, ERROR, or CRITICAL.",
+            )
+            return
+        level = getattr(logging, level_name)
+        logging.getLogger().setLevel(level)
+        for handler in logging.getLogger().handlers:
+            handler.setLevel(level)
+        await self._safe_send(
+            message.channel, f"✅ Log level set to {level_name}."
+        )
 
     async def cmd_send_primary(self, message: discord.Message):
         """Send message to primary channel (renamed from $sendprimary to $txt)"""
@@ -1006,10 +1560,11 @@ class CommandHandler:
         await self._safe_send(
             message.channel, f"📤 Sending to primary channel:\n```{message_text}```"
         )
-        try:
-            self.discord_to_mesh.put_nowait(message_text)
-        except queue.Full:
-            logger.warning("Discord to mesh queue is full, dropping message")
+        if not self._enqueue_discord_message(message_text):
+            await self._safe_send(
+                message.channel,
+                "⚠️ Message queue is full, please try again in a moment.",
+            )
             return False
 
     async def cmd_send_node(self, message: discord.Message):
@@ -1094,14 +1649,11 @@ class CommandHandler:
                 message.channel,
                 f"📤 Sending to node **{node['long_name']}** (ID: {final_node_id}):\n```{message_text}```",
             )
-            try:
-                self.discord_to_mesh.put_nowait(
-                    f"nodenum={final_node_id} {message_text}"
-                )
-            except queue.Full:
-                logger.warning("Discord to mesh queue is full, dropping message")
+            if not self._enqueue_discord_message(
+                f"nodenum={final_node_id} {message_text}"
+            ):
                 await self._safe_send(
-                    message.channel, "❌ Message queue is full, please try again later."
+                    message.channel, "⚠️ Message queue is full, please try again later."
                 )
                 return
             logger.info(f"Sent message with node ID: {final_node_id}")
@@ -1144,26 +1696,43 @@ class CommandHandler:
             )
             return
 
-        active_nodes = []
-        for node in nodes:
-            try:
-                node_info = self._format_node_info(node)
-                active_nodes.append(node_info)
-            except Exception as e:
-                logger.error(
-                    f"Error processing node {node.get('node_id', 'Unknown')}: {e}"
-                )
-                continue
+        await self._attach_locations(nodes)
 
-        response = (
-            f"📡 **Active Nodes (Last {BOT_CONFIG['active_node_threshold']} minutes):**\n"
-            + "\n".join(active_nodes)
-        )
+        threshold = BOT_CONFIG["active_node_threshold"]
+        summary_lines = [
+            f"Active nodes: {len(nodes)} (last {threshold} minutes)",
+        ]
         try:
-            await self._send_long_message(message.channel, response)
+            embed_color = BOT_CONFIG.get("embed_color", 0x00FF00)
+        except Exception:
+            embed_color = 0x00FF00
+
+        try:
+            page_size = BOT_CONFIG.get("node_page_size", 40) if isinstance(BOT_CONFIG, dict) else 40
+            total_pages = max(1, (len(nodes) + page_size - 1) // page_size)
+            for page in range(total_pages):
+                slice_nodes = nodes[page * page_size : (page + 1) * page_size]
+                title = f"Active Nodes (last {threshold} min)"
+                if total_pages > 1:
+                    title = f"{title} ({page+1}/{total_pages})"
+                if page == 0 and summary_lines:
+                    summary_embed = discord.Embed(
+                        title=title,
+                        description="\n".join(summary_lines),
+                        color=embed_color,
+                        timestamp=get_utc_time(),
+                    )
+                    summary_embed.set_footer(text="UTC time | ID column shows last 4 chars")
+                    await message.channel.send(embed=summary_embed)
+
+                tables = self._build_nodes_tables(title, slice_nodes, page + 1, total_pages)
+                for table in tables:
+                    await message.channel.send(table)
         except Exception as send_error:
-            logger.error(f"Error sending message to channel: {send_error}")
-            await message.channel.send("❌ Error sending message to channel.")
+            logger.error(f"Error sending active nodes embed: {send_error}")
+            await self._safe_send(
+                message.channel, "❌ Error sending message to channel."
+            )
 
     async def cmd_all_nodes(self, message: discord.Message):
         """Show all known nodes"""
@@ -1180,24 +1749,288 @@ class CommandHandler:
             await message.channel.send("❌ Error retrieving node data from database.")
             return
 
-        node_list = []
-        for node in nodes:
-            try:
-                node_info = self._format_node_info(node)
-                node_list.append(node_info)
-            except Exception as e:
-                logger.error(
-                    f"Error processing node {node.get('node_id', 'Unknown')}: {e}"
-                )
-                continue
+        await self._attach_locations(nodes)
 
-        response = "📡 **All Known Nodes:**\n" + "\n".join(node_list)
         try:
-            await self._send_long_message(message.channel, response)
+            threshold = BOT_CONFIG["active_node_threshold"]
+        except Exception:
+            threshold = 60
+        try:
+            now = datetime.utcnow()
+            active_cutoff = now - timedelta(minutes=threshold)
+            active_count = 0
+            for node in nodes:
+                last_heard = node.get("last_heard")
+                if not last_heard:
+                    continue
+                try:
+                    if "T" in last_heard:
+                        dt = datetime.fromisoformat(last_heard.replace("Z", "+00:00"))
+                        if dt.tzinfo is not None:
+                            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                    else:
+                        dt = datetime.strptime(last_heard, "%Y-%m-%d %H:%M:%S")
+                    if dt > active_cutoff:
+                        active_count += 1
+                except Exception:
+                    continue
+        except Exception:
+            active_count = 0
+
+        routers = sum(1 for node in nodes if node.get("is_router"))
+        summary_lines = [
+            f"Total nodes: {len(nodes)}",
+            f"Active (last {threshold} min): {active_count}",
+            f"Routers: {routers}",
+        ]
+        try:
+            embed_color = BOT_CONFIG.get("embed_color", 0x00FF00)
+        except Exception:
+            embed_color = 0x00FF00
+
+        try:
+            page_size = BOT_CONFIG.get("node_page_size", 40) if isinstance(BOT_CONFIG, dict) else 40
+            total_pages = max(1, (len(nodes) + page_size - 1) // page_size)
+            for page in range(total_pages):
+                slice_nodes = nodes[page * page_size : (page + 1) * page_size]
+                title = "All Known Nodes"
+                if total_pages > 1:
+                    title = f"{title} ({page+1}/{total_pages})"
+                if page == 0 and summary_lines:
+                    summary_embed = discord.Embed(
+                        title=title,
+                        description="\n".join(summary_lines),
+                        color=embed_color,
+                        timestamp=get_utc_time(),
+                    )
+                    summary_embed.set_footer(text="UTC time | ID column shows last 4 chars")
+                    await message.channel.send(embed=summary_embed)
+
+                tables = self._build_nodes_tables(title, slice_nodes, page + 1, total_pages)
+                for table in tables:
+                    await message.channel.send(table)
         except Exception as send_error:
-            logger.error(f"Error sending message to channel: {send_error}")
+            logger.error(f"Error sending all nodes embed: {send_error}")
             await self._safe_send(
                 message.channel, "❌ Error sending message to channel."
+            )
+
+    async def cmd_node(self, message: discord.Message):
+        """Show a node profile card"""
+        try:
+            parts = message.content.strip().split(maxsplit=1)
+            if len(parts) < 2:
+                await self._safe_send(message.channel, "Use: `$node <name>`")
+                return
+            name = parts[1].strip()
+            if not name:
+                await self._safe_send(message.channel, "Use: `$node <name>`")
+                return
+
+            node = await self._run_db_query(
+                self.database.find_node_by_name, name, timeout=5
+            )
+            if not node:
+                await self._safe_send(
+                    message.channel, f"No node found matching '{name}'."
+                )
+                return
+
+            node_id = node.get("node_id")
+            snapshot = await self._run_db_query(
+                self.database.get_node_snapshot, node_id, timeout=5
+            )
+            if not snapshot:
+                snapshot = node
+
+            last_msg = await self._run_db_query(
+                self.database.get_last_message_for_node, node_id, timeout=5
+            )
+            packet_window = int(HEALTH_SCORE.get("packet_rate_window_hours", 24))
+            msg_counts = await self._run_db_query(
+                self.database.get_message_counts_by_node, packet_window, timeout=5
+            )
+            message_rate = None
+            if msg_counts:
+                for row in msg_counts:
+                    if row.get("node_id") == node_id:
+                        message_rate = (row.get("message_count") or 0) / max(
+                            1, packet_window
+                        )
+                        break
+
+            battery_hist = await self._run_db_query(
+                self.database.get_metric_history,
+                node_id,
+                "battery_level",
+                6,
+                timeout=5,
+            )
+            temp_hist = await self._run_db_query(
+                self.database.get_metric_history,
+                node_id,
+                "temperature",
+                6,
+                timeout=5,
+            )
+            snr_hist = await self._run_db_query(
+                self.database.get_metric_history,
+                node_id,
+                "snr",
+                6,
+                timeout=5,
+            )
+            battery_slope = self._metric_slope_per_hour(battery_hist or [])
+            temp_slope = self._metric_slope_per_hour(temp_hist or [])
+            snr_slope = self._metric_slope_per_hour(snr_hist or [])
+
+            health_score, _ = self._compute_health_score(
+                snapshot, message_rate, battery_slope
+            )
+
+            embed = discord.Embed(
+                title=f"📟 Node Profile: {snapshot.get('long_name')}",
+                description=f"ID: `{node_id}`",
+                color=0x00BFFF,
+                timestamp=get_utc_time(),
+            )
+
+            short_name = snapshot.get("short_name") or "n/a"
+            model = snapshot.get("hw_model") or "n/a"
+            firmware = snapshot.get("firmware_version") or "n/a"
+            hops = snapshot.get("hops_away")
+            last_heard = snapshot.get("last_heard")
+            last_heard_age = self._format_age(last_heard)
+            presence = snapshot.get("presence_state") or "unknown"
+
+            embed.add_field(
+                name="Identity",
+                value=(
+                    f"Short: {short_name}\n"
+                    f"Model: {model}\n"
+                    f"FW: {firmware}"
+                ),
+                inline=True,
+            )
+            embed.add_field(
+                name="Status",
+                value=(
+                    f"Last heard: {last_heard_age}\n"
+                    f"Hops: {hops if hops is not None else 'n/a'}\n"
+                    f"Presence: {presence}"
+                ),
+                inline=True,
+            )
+            if health_score is not None:
+                embed.add_field(
+                    name="Health Score",
+                    value=f"{health_score:.1f}/100",
+                    inline=True,
+                )
+
+            def fmt(val, suffix=""):
+                if val is None:
+                    return "n/a"
+                try:
+                    return f"{float(val):.2f}{suffix}"
+                except Exception:
+                    return f"{val}{suffix}"
+
+            telemetry_lines = [
+                f"Battery: {fmt(snapshot.get('battery_level'), '%')}",
+                f"Voltage: {fmt(snapshot.get('voltage'), 'V')}",
+                f"Temp: {fmt(snapshot.get('temperature'), '°C')}",
+                f"Humidity: {fmt(snapshot.get('humidity'), '%')}",
+                f"Pressure: {fmt(snapshot.get('pressure'), ' hPa')}",
+                f"SNR: {fmt(snapshot.get('snr'), ' dB')}",
+                f"RSSI: {fmt(snapshot.get('rssi'), ' dBm')}",
+            ]
+            uptime_seconds = snapshot.get("uptime_seconds")
+            if uptime_seconds is not None:
+                try:
+                    uptime_text = str(timedelta(seconds=int(float(uptime_seconds))))
+                except Exception:
+                    uptime_text = "n/a"
+                telemetry_lines.append(f"Uptime: {uptime_text}")
+
+            embed.add_field(
+                name="Telemetry",
+                value="\n".join(telemetry_lines),
+                inline=False,
+            )
+
+            trend_lines = []
+            if battery_slope is not None:
+                trend_lines.append(f"Battery slope: {battery_slope:+.2f}%/hr")
+            if temp_slope is not None:
+                trend_lines.append(f"Temp slope: {temp_slope:+.2f}°C/hr")
+            if snr_slope is not None:
+                trend_lines.append(f"SNR slope: {snr_slope:+.2f} dB/hr")
+            if message_rate is not None:
+                trend_lines.append(f"Packet rate: {message_rate:.2f}/hr")
+            if trend_lines:
+                embed.add_field(
+                    name="Trends",
+                    value="\n".join(trend_lines),
+                    inline=False,
+                )
+
+            if last_msg:
+                from_id = last_msg.get("from_node_id")
+                to_id = last_msg.get("to_node_id")
+                direction = "received" if to_id == node_id else "sent"
+                other_id = from_id if to_id == node_id else to_id
+                other_name = (
+                    await self._run_db_query(
+                        self.database.get_node_display_name, other_id, timeout=2
+                    )
+                    if other_id
+                    else "unknown"
+                )
+                msg_text = last_msg.get("message_text") or "<non-text payload>"
+                msg_text = msg_text.replace("\n", " ").strip()
+                if len(msg_text) > 120:
+                    msg_text = msg_text[:117] + "..."
+                ts = last_msg.get("timestamp") or "unknown"
+                embed.add_field(
+                    name="Last Message",
+                    value=f"{direction} {self._format_age(ts)} ago\nWith: {other_name}\n“{msg_text}”",
+                    inline=False,
+                )
+
+            lat = snapshot.get("latitude")
+            lon = snapshot.get("longitude")
+            map_payload = None
+            if lat is not None and lon is not None:
+                try:
+                    lat_f = float(lat)
+                    lon_f = float(lon)
+                    embed.add_field(
+                        name="Location",
+                        value=f"{lat_f:.5f}, {lon_f:.5f}\nhttps://maps.google.com/?q={lat_f},{lon_f}",
+                        inline=False,
+                    )
+                    map_payload = await self._get_map_snapshot(lat_f, lon_f)
+                    if map_payload and map_payload.get("url"):
+                        embed.set_image(url=map_payload["url"])
+                except Exception:
+                    pass
+            if map_payload and map_payload.get("path"):
+                filename = os.path.basename(map_payload["path"])
+                try:
+                    file_obj = discord.File(map_payload["path"], filename=filename)
+                    embed.set_image(url=f"attachment://{filename}")
+                    await message.channel.send(embed=embed, file=file_obj)
+                    return
+                except Exception:
+                    pass
+
+            await message.channel.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error building node profile: {e}")
+            await self._safe_send(
+                message.channel, "❌ Error building node profile."
             )
 
     async def cmd_telemetry(self, message: discord.Message):
@@ -1226,18 +2059,6 @@ class CommandHandler:
             )
             return
 
-        # Check connection status safely
-        connection_status = "❌ Disconnected"
-        if self.meshtastic.iface:
-            try:
-                if hasattr(self.meshtastic.iface, "isConnected") and callable(
-                    self.meshtastic.iface.isConnected
-                ):
-                    if self.meshtastic.iface.isConnected():
-                        connection_status = "✅ Connected"
-            except Exception:
-                connection_status = "❌ Disconnected"
-
         embed = discord.Embed(
             title="📊 Telemetry Summary",
             description="Last 60 minutes of network telemetry data",
@@ -1249,8 +2070,7 @@ class CommandHandler:
         embed.add_field(
             name="📡 **Network Status**",
             value=f"""Total Nodes: {summary.get("total_nodes", 0)}
-Active Nodes: {summary.get("active_nodes", 0)}
-Connection: {connection_status}""",
+Active Nodes: {summary.get("active_nodes", 0)}""",
             inline=True,
         )
 
@@ -1288,6 +2108,254 @@ Connection: {connection_status}""",
         embed.add_field(name="📶 **Signal Quality**", value=signal_data, inline=True)
 
         await message.channel.send(embed=embed)
+
+        # Latest per-node telemetry snapshot (paged later)
+        try:
+            nodes = await self._run_db_query(
+                self.database.get_latest_telemetry_snapshot, limit=200, timeout=10
+            )
+        except Exception as node_err:
+            logger.error(f"Error loading nodes for telemetry details: {node_err}")
+            nodes = []
+
+        def _fmt_pct(val):
+            if val is None:
+                return None
+            try:
+                return f"{int(val)}%"
+            except Exception:
+                return None
+
+        def _fmt_num(val, decimals=1, suffix=""):
+            if val is None:
+                return None
+            try:
+                return f"{float(val):.{decimals}f}{suffix}"
+            except Exception:
+                return None
+
+        def _fmt_uptime(seconds):
+            if not seconds:
+                return "--"
+            try:
+                seconds = float(seconds)
+            except Exception:
+                return "--"
+            if seconds <= 0:
+                return "0s"
+            minutes = seconds / 60
+            hours = minutes / 60
+            days = hours / 24
+            if days >= 1:
+                return f"{days:.1f}d"
+            if hours >= 1:
+                return f"{hours:.1f}h"
+            return f"{minutes:.0f}m"
+
+        def _fmt_seen(last_heard):
+            age = self._format_age_short(last_heard)
+            return age if age else "--"
+
+        rows = []
+        for node in nodes or []:
+            battery = node.get("battery_level")
+            voltage = node.get("voltage")
+            chan_util = node.get("channel_utilization")
+            air_util = node.get("air_util_tx")
+            uptime = node.get("uptime_seconds")
+            temp = node.get("temperature")
+            humid = node.get("humidity")
+            pressure = node.get("pressure")
+            snr = node.get("snr")
+            rssi = node.get("rssi")
+
+            if all(
+                v is None
+                for v in [
+                    battery,
+                    voltage,
+                    chan_util,
+                    air_util,
+                    uptime,
+                    temp,
+                    humid,
+                    pressure,
+                    snr,
+                    rssi,
+                ]
+            ):
+                continue
+
+            name = (
+                node.get("long_name")
+                or node.get("short_name")
+                or node.get("node_id")
+                or "Unknown"
+            )
+            name = self._truncate_text(str(name), 18)
+            node_id = str(node.get("node_id") or "")
+            node_id_short = node_id[-4:] if len(node_id) >= 4 else node_id or "--"
+            age = _fmt_seen(node.get("last_heard"))
+
+            bat_txt = _fmt_pct(battery) or "--"
+            volt_txt = _fmt_num(voltage, decimals=3, suffix="") or "--"
+            temp_txt = _fmt_num(temp, decimals=1, suffix="") or "--"
+            humid_txt = _fmt_num(humid, decimals=0, suffix="") or "--"
+            press_txt = _fmt_num(pressure, decimals=0, suffix="") or "--"
+            chan_txt = _fmt_num(chan_util, decimals=1, suffix="") or "--"
+            air_txt = _fmt_num(air_util, decimals=1, suffix="") or "--"
+            up_txt = _fmt_uptime(uptime)
+            seen_txt = age or "--"
+            pos_ts = node.get("position_ts") or node.get("last_heard")
+
+            rows.append(
+                {
+                    "id": node_id_short,
+                    "name": name,
+                    "bat": bat_txt,
+                    "volt": volt_txt,
+                    "temp": temp_txt,
+                    "humid": humid_txt,
+                    "press": press_txt,
+                    "chan": chan_txt,
+                    "air": air_txt,
+                    "uptime": up_txt,
+                    "seen": seen_txt,
+                    "pos_ts": pos_ts,
+                }
+            )
+
+        if rows:
+            per_page = 40
+            total_pages = max(1, (len(rows) + per_page - 1) // per_page)
+            for page in range(total_pages):
+                slice_rows = rows[page * per_page : (page + 1) * per_page]
+                header = (
+                    f"{'ID':<6} | {'Name':<20} | {'Bat%':>5} | {'Volt':>6} | "
+                    f"{'Temp°C':>6} | {'Hum%':>5} | {'hPa':>6} | "
+                    f"{'Ch%':>5} | {'Air%':>5} | {'Uptime':>8} | {'Seen':>6}"
+                )
+                divider = "-" * len(header)
+                table_lines = [header, divider]
+                for r in slice_rows:
+                    line = (
+                        f"{r['id']:<6} | "
+                        f"{r['name']:<20} | "
+                        f"{r['bat']:>5} | "
+                        f"{r['volt']:>6} | "
+                        f"{r['temp']:>6} | "
+                        f"{r['humid']:>5} | "
+                        f"{r['press']:>6} | "
+                        f"{r['chan']:>5} | "
+                        f"{r['air']:>5} | "
+                        f"{r['uptime']:>8} | "
+                        f"{r['seen']:>6}"
+                    )
+                    table_lines.append(line)
+
+                block = "```text\n" + "\n".join(table_lines) + "\n```"
+                await message.channel.send(block)
+
+    async def cmd_history(self, message: discord.Message):
+        """Show recent metric history: $history <node> <metric>"""
+        try:
+            parts = message.content.strip().split()
+            flags = [p for p in parts if p.startswith("--")]
+            args = [p for p in parts if not p.startswith("--")]
+            show_spark = "--spark" in flags or "--sparkline" in flags
+            if len(args) < 3:
+                await self._safe_send(
+                    message.channel,
+                    "Use: `$history <node> <metric> [--spark]` (metric: battery_level, voltage, temperature, humidity, pressure, snr, rssi, channel_utilization, air_util_tx)",
+                )
+                return
+            name = args[1]
+            metric = args[2]
+            node = await self._run_db_query(
+                self.database.find_node_by_name, name, timeout=5
+            )
+            if not node:
+                await self._safe_send(
+                    message.channel, f"No node found matching '{name}'."
+                )
+                return
+            hist = await self._run_db_query(
+                self.database.get_metric_history,
+                node.get("node_id"),
+                metric,
+                20,
+                timeout=5,
+            )
+            if not hist:
+                await self._safe_send(
+                    message.channel, f"No data for {metric} on {node.get('long_name')}"
+                )
+                return
+            lines = [f"{node.get('long_name')} [{metric}] last {len(hist)}:"]
+            if show_spark:
+                values = [h.get("value") for h in reversed(hist) if h.get("value") is not None]
+                spark = self._build_sparkline(values)
+                if spark:
+                    lines.append(f"Spark: {spark}")
+                if values:
+                    try:
+                        vmin = min(values)
+                        vmax = max(values)
+                        delta = values[-1] - values[0] if len(values) > 1 else 0
+                        lines.append(
+                            f"Range: {vmin:.2f} → {vmax:.2f} | Δ {delta:+.2f}"
+                        )
+                    except Exception:
+                        pass
+            for entry in hist:
+                val = entry.get("value")
+                ts = entry.get("timestamp")
+                lines.append(f"- {ts}: {val}")
+            await self._safe_send(message.channel, "\n".join(lines))
+        except Exception as e:
+            logger.error(f"Error in history command: {e}")
+            await self._safe_send(message.channel, "Error fetching history.")
+
+    async def cmd_dbhealth(self, message: discord.Message):
+        """Show database health and last timestamps"""
+        try:
+            stats = await self._run_db_query(self.database.get_db_health, timeout=5)
+            if not stats:
+                await self._safe_send(message.channel, "DB stats unavailable.")
+                return
+            embed = discord.Embed(
+                title="🗄️ DB Health",
+                color=0x3498DB,
+                timestamp=get_utc_time(),
+            )
+            embed.add_field(
+                name="Counts",
+                value=(
+                    f"Nodes: {stats.get('nodes',0)}\n"
+                    f"Telemetry: {stats.get('telemetry',0)}\n"
+                    f"Positions: {stats.get('positions',0)}\n"
+                    f"Messages: {stats.get('messages',0)}\n"
+                ),
+                inline=True,
+            )
+            embed.add_field(
+                name="Last seen",
+                value=(
+                    f"Telemetry: {stats.get('last_telem') or 'n/a'}\n"
+                    f"Position: {stats.get('last_pos') or 'n/a'}\n"
+                    f"Message: {stats.get('last_msg') or 'n/a'}\n"
+                ),
+                inline=True,
+            )
+            embed.add_field(
+                name="Size",
+                value=f"{stats.get('db_size_mb','?')} MB",
+                inline=True,
+            )
+            await message.channel.send(embed=embed)
+        except Exception as e:
+            logger.error(f"Error in dbhealth command: {e}")
+            await self._safe_send(message.channel, "Error fetching DB health.")
 
     async def cmd_status(self, message: discord.Message):
         """Show bridge status"""
@@ -1506,22 +2574,23 @@ Avg Hops: {topology["avg_hops"]:.1f}""",
             # Delete status message
             await status_msg.delete()
 
-            # Create readable connection tree
-            connection_tree = self._create_connection_tree(
-                nodes, topology["connections"]
+            connection_lines = self._build_topology_ascii(
+                nodes, topology.get("connections", [])
             )
 
-            # Add summary info
             total_nodes = len(nodes)
-            active_connections = len(topology["connections"])
-            avg_hops = topology.get("avg_hops", 0)
-
-            # Send the formatted tree
-            await self._send_long_message(message.channel, connection_tree)
-
-            # Send summary
-            summary = f"\n📊 **Network Summary:** {total_nodes} radios | {active_connections} routes | {avg_hops:.1f} avg hops"
+            active_connections = len(topology.get("connections", []))
+            avg_hops = topology.get("avg_hops", 0) or 0
+            summary = (
+                f"Network Topology (last 24h)\n"
+                f"Radios: {total_nodes} | Connections: {active_connections} | Avg hops: {avg_hops:.1f}"
+            )
             await message.channel.send(summary)
+
+            chunks = self._chunk_lines(connection_lines, 1900)
+            for chunk in chunks:
+                block = "```text\n" + "\n".join(chunk) + "\n```"
+                await message.channel.send(block)
 
         except Exception as e:
             logger.error(f"Error creating topology tree: {e}")
@@ -1886,115 +2955,105 @@ Active Hours: {len(hourly_dist)}""",
             return "🔴 Poor"
 
     async def cmd_leaderboard(self, message: discord.Message):
-        """Show network performance leaderboards"""
+        """Show node health leaderboards"""
         try:
             nodes = await self._get_cached_data(
                 "all_nodes", self.database.get_all_nodes
             )
-            stats = await self._run_db_query(
-                self.database.get_message_statistics, 24, timeout=10
-            )
-
             if not nodes:
                 await self._safe_send(
                     message.channel, "📡 No nodes available for leaderboard."
                 )
                 return
 
+            packet_window = int(HEALTH_SCORE.get("packet_rate_window_hours", 24))
+            msg_counts = await self._run_db_query(
+                self.database.get_message_counts_by_node, packet_window, timeout=10
+            )
+            msg_map = {row["node_id"]: row.get("message_count", 0) for row in msg_counts}
+
+            scores = []
+            for node in nodes:
+                node_id = node.get("node_id")
+                if not node_id:
+                    continue
+                battery_hist = await self._run_db_query(
+                    self.database.get_metric_history,
+                    node_id,
+                    "battery_level",
+                    6,
+                    timeout=5,
+                )
+                battery_slope = self._metric_slope_per_hour(battery_hist or [])
+                message_rate = msg_map.get(node_id, 0) / max(1, packet_window)
+                score, _ = self._compute_health_score(
+                    node, message_rate, battery_slope
+                )
+                if score is None:
+                    continue
+                scores.append(
+                    {
+                        "node": node,
+                        "score": score,
+                        "message_rate": message_rate,
+                        "battery_slope": battery_slope,
+                    }
+                )
+
+            if not scores:
+                await self._safe_send(
+                    message.channel,
+                    "📡 Not enough data to compute health scores yet.",
+                )
+                return
+
+            top = sorted(scores, key=lambda x: x["score"], reverse=True)[:5]
+            bottom = sorted(scores, key=lambda x: x["score"])[:5]
+            rate_top = sorted(
+                scores, key=lambda x: x["message_rate"], reverse=True
+            )[:5]
+
             embed = discord.Embed(
-                title="🏆 Network Performance Leaderboard",
-                description="Top performing nodes and network statistics",
+                title="🏆 Node Health Leaderboards",
+                description=f"Scores based on battery slope, uptime, last-heard age, and packet rate ({packet_window}h window).",
                 color=0xFFD700,
                 timestamp=get_utc_time(),
             )
 
-            # Most Active Nodes (by message count)
-            active_leaderboard = ""
-            if stats.get("total_messages", 0) > 0:
-                # This would need message count per node - simplified for now
-                active_leaderboard = "📊 **Most Active Nodes**\n"
-                active_leaderboard += "• Data collection in progress...\n"
-                active_leaderboard += "• Check back after more activity!\n"
-            else:
-                active_leaderboard = (
-                    "📊 **Most Active Nodes**\nNo message data available yet"
-                )
+            def format_line(idx, entry):
+                node = entry["node"]
+                name = node.get("long_name") or node.get("short_name") or node.get("node_id")
+                age = self._format_age(node.get("last_heard"))
+                rate = entry.get("message_rate", 0)
+                medal = "🥇" if idx == 0 else "🥈" if idx == 1 else "🥉" if idx == 2 else "🏅"
+                return f"{medal} {name} — {entry['score']:.1f} | last heard {age} | {rate:.2f}/hr"
+
+            top_lines = [format_line(i, entry) for i, entry in enumerate(top)]
+            bottom_lines = [format_line(i, entry) for i, entry in enumerate(bottom)]
 
             embed.add_field(
-                name="🏆 **Activity Leaders**", value=active_leaderboard, inline=True
-            )
-
-            # Best Signal Quality
-            signal_leaderboard = ""
-            nodes_with_signal = [n for n in nodes if n.get("snr") is not None]
-            if nodes_with_signal:
-                # Sort by SNR (highest first)
-                sorted_nodes = sorted(
-                    nodes_with_signal, key=lambda x: x.get("snr", 0), reverse=True
-                )
-                signal_leaderboard = "📶 **Best Signal Quality**\n"
-                for i, node in enumerate(sorted_nodes[:5]):
-                    medal = (
-                        "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else "🏅"
-                    )
-                    signal_leaderboard += f"{medal} **{node['long_name']}** - {node.get('snr', 0):.1f} dB\n"
-            else:
-                signal_leaderboard = (
-                    "📶 **Best Signal Quality**\nNo signal data available"
-                )
-
-            embed.add_field(
-                name="📡 **Signal Champions**", value=signal_leaderboard, inline=True
-            )
-
-            # Longest Uptime (simplified)
-            uptime_leaderboard = "⏰ **Longest Active**\n"
-            active_nodes = [n for n in nodes if n.get("last_heard")]
-            if active_nodes:
-                # Sort by last_heard (most recent first)
-                sorted_uptime = sorted(
-                    active_nodes, key=lambda x: x.get("last_heard", ""), reverse=True
-                )
-                for i, node in enumerate(sorted_uptime[:5]):
-                    medal = (
-                        "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else "🏅"
-                    )
-                    last_heard = node.get("last_heard", "Unknown")
-                    uptime_leaderboard += (
-                        f"{medal} **{node['long_name']}** - {last_heard}\n"
-                    )
-            else:
-                uptime_leaderboard += "No activity data available"
-
-            embed.add_field(
-                name="⏰ **Uptime Champions**", value=uptime_leaderboard, inline=True
-            )
-
-            # Network Statistics
-            total_nodes = len(nodes)
-            active_count = 0
-            for n in nodes:
-                if n.get("last_heard"):
-                    try:
-                        last_heard = datetime.fromisoformat(
-                            n["last_heard"].replace("Z", "+00:00")
-                        )
-                        if last_heard > datetime.now() - timedelta(hours=1):
-                            active_count += 1
-                    except (ValueError, TypeError) as e:
-                        logger.warning(
-                            f"Error parsing last_heard for node {n.get('long_name', 'Unknown')}: {e}"
-                        )
-                        continue
-
-            embed.add_field(
-                name="📊 **Network Stats**",
-                value=f"""Total Nodes: {total_nodes}
-Active (1h): {active_count}
-Total Messages: {stats.get("total_messages", 0)}
-Unique Senders: {stats.get("unique_senders", 0)}""",
+                name="Top Health",
+                value="\n".join(top_lines)[:1024],
                 inline=False,
             )
+            embed.add_field(
+                name="Needs Attention",
+                value="\n".join(bottom_lines)[:1024],
+                inline=False,
+            )
+
+            rate_lines = []
+            for i, entry in enumerate(rate_top):
+                node = entry["node"]
+                name = node.get("long_name") or node.get("short_name") or node.get("node_id")
+                medal = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else "🏅"
+                rate_lines.append(f"{medal} {name} — {entry['message_rate']:.2f}/hr")
+            if rate_lines:
+                embed.add_field(
+                    name="Packet Rate Leaders",
+                    value="\n".join(rate_lines)[:1024],
+                    inline=False,
+                )
 
             await message.channel.send(embed=embed)
 
@@ -2299,8 +3358,21 @@ Art Quality: {"🎨" * min(5, total_nodes // 2)}""",
                         f"🛣️ **{from_name}** → **{to_name}** ({hops_count} hops)\n"
                     )
                 elif packet_type == "movement":
-                    distance_moved = packet.get("distance_moved", 0)
-                    packet_text += f"🚶 **{from_name}** moved {distance_moved:.1f}m\n"
+                    distance_moved = packet.get("distance_moved")
+                    speed_mps = packet.get("speed_mps")
+                    parts = []
+                    if distance_moved is not None:
+                        try:
+                            parts.append(f"moved {float(distance_moved):.1f}m")
+                        except Exception:
+                            pass
+                    if speed_mps is not None:
+                        try:
+                            parts.append(f"{float(speed_mps):.1f} m/s")
+                        except Exception:
+                            pass
+                    details = f" ({', '.join(parts)})" if parts else ""
+                    packet_text += f"🚶 **{from_name}** on the move{details}\n"
                 else:
                     packet_text += f"📦 **{from_name}** ({portnum}) - {packet_type}\n"
 
@@ -2713,6 +3785,421 @@ Last Heard: {nodes[0].get("last_heard", "Unknown")}""",
         except Exception as e:
             logger.error(f"Error formatting node info: {e}")
             return f"**Node {node.get('node_id', 'Unknown')}** - Error formatting data"
+
+    def _truncate_text(self, text: str, width: int) -> str:
+        """Truncate text to a fixed width using ASCII ellipsis."""
+        if width <= 0:
+            return ""
+        if text is None:
+            text = ""
+        text = str(text)
+        if len(text) <= width:
+            return text
+        if width <= 3:
+            return text[:width]
+        return text[: width - 3] + "..."
+
+    def _format_age_short(self, last_heard: Optional[str]) -> str:
+        """Return age as short text like 5m, 2h, 1d."""
+        if not last_heard:
+            return "--"
+        dt = None
+        try:
+            if isinstance(last_heard, str):
+                if "T" in last_heard:
+                    dt = datetime.fromisoformat(last_heard.replace("Z", "+00:00"))
+                else:
+                    dt = datetime.strptime(last_heard, "%Y-%m-%d %H:%M:%S")
+            elif isinstance(last_heard, datetime):
+                dt = last_heard
+        except Exception:
+            dt = None
+        if not dt:
+            return "--"
+        now = datetime.utcnow()
+        if dt.tzinfo is not None:
+            now = datetime.now(tz=dt.tzinfo)
+        delta = now - dt
+        minutes = int(delta.total_seconds() // 60)
+        if minutes < 0:
+            minutes = 0
+        if minutes < 60:
+            return f"{minutes}m"
+        hours = minutes // 60
+        if hours < 24:
+            return f"{hours}h"
+        days = hours // 24
+        return f"{days}d"
+
+    def _format_node_row(self, node: Dict[str, Any]) -> str:
+        """Format a node row for compact, human-readable tables."""
+        name = (
+            node.get("long_name")
+            or node.get("short_name")
+            or node.get("node_id")
+            or "Unknown"
+        )
+        name = self._truncate_text(str(name), 20)
+        node_id = str(node.get("node_id") or "")
+        node_id_short = node_id[-4:] if len(node_id) >= 4 else node_id or "--"
+        batt = node.get("battery_level")
+        volt = node.get("voltage")
+        chan = node.get("channel_utilization")
+        air = node.get("air_util_tx")
+        uptime = node.get("uptime_seconds")
+        last = self._format_age_short(node.get("last_heard"))
+
+        def fmt_pct(val):
+            try:
+                return f"{int(val)}%"
+            except Exception:
+                return None
+
+        def fmt_num(val, decimals=1):
+            try:
+                return f"{float(val):.{decimals}f}"
+            except Exception:
+                return None
+
+        def fmt_uptime(seconds):
+            if not seconds:
+                return None
+            try:
+                seconds = float(seconds)
+            except Exception:
+                return None
+            if seconds <= 0:
+                return "0s"
+            minutes = seconds / 60
+            hours = minutes / 60
+            days = hours / 24
+            if days >= 1:
+                return f"{days:.1f}d"
+            if hours >= 1:
+                return f"{hours:.1f}h"
+            return f"{minutes:.0f}m"
+
+        bat_txt = fmt_pct(batt) or "--"
+        volt_txt = fmt_num(volt, decimals=3) or "--"
+        chan_txt = fmt_num(chan, decimals=1) or "--"
+        air_txt = fmt_num(air, decimals=1) or "--"
+        up_txt = fmt_uptime(uptime) or "--"
+        seen_txt = last or "--"
+        city = node.get("approx_location") or ""
+        city_txt = self._truncate_text(str(city), 16) if city else ""
+
+        return (
+            f"{node_id_short:<6} | {name:<20} | "
+            f"{bat_txt:>5} | {volt_txt:>6} | "
+            f"{chan_txt:>5} | {air_txt:>5} | {up_txt:>8} | {seen_txt:>6} | {city_txt:<16}"
+        )
+
+    def _chunk_lines(self, lines: List[str], max_chars: int) -> List[List[str]]:
+        """Chunk lines to fit within Discord embed description limits."""
+        chunks = []
+        current = []
+        current_len = 0
+        for line in lines:
+            line_len = len(line) + 1
+            if current and current_len + line_len > max_chars:
+                chunks.append(current)
+                current = []
+                current_len = 0
+            current.append(line)
+            current_len += line_len
+        if current:
+            chunks.append(current)
+        return chunks
+
+    async def _reverse_geocode(self, lat: float, lon: float) -> Optional[str]:
+        """Lookup nearest locality using Nominatim (cached, best-effort)."""
+        try:
+            from config import BOT_CONFIG
+            if not BOT_CONFIG.get("geocode_enabled", True):
+                return None
+            timeout = BOT_CONFIG.get("geocode_timeout", 3)
+        except Exception:
+            timeout = 3
+        try:
+            lat = float(lat)
+            lon = float(lon)
+        except Exception:
+            return None
+
+        key = f"{round(lat, 2)},{round(lon, 2)}"
+        if key in self._geo_cache:
+            return self._geo_cache[key]
+
+        def _call():
+            try:
+                resp = requests.get(
+                    "https://nominatim.openstreetmap.org/reverse",
+                    params={"format": "json", "lat": lat, "lon": lon, "zoom": 10},
+                    headers={"User-Agent": "meshtastic-discord-bot/1.0"},
+                    timeout=timeout,
+                )
+                if resp.status_code != 200:
+                    return None
+                data = resp.json()
+                addr = data.get("address", {})
+                for field in ["city", "town", "village", "hamlet", "county"]:
+                    if addr.get(field):
+                        return addr[field]
+                if data.get("display_name"):
+                    return data["display_name"].split(",")[0]
+            except Exception:
+                return None
+            return None
+
+        city = await asyncio.to_thread(_call)
+        if city:
+            self._geo_cache[key] = city
+        return city
+
+    async def _attach_locations(self, nodes: List[Dict[str, Any]]):
+        """Add approx_location to nodes when lat/lon available."""
+        try:
+            from config import BOT_CONFIG
+            max_lookups = BOT_CONFIG.get("geocode_max_per_run", 20)
+        except Exception:
+            max_lookups = 20
+
+        tasks = []
+        for node in nodes or []:
+            if node.get("approx_location"):
+                continue
+            lat = node.get("latitude")
+            lon = node.get("longitude")
+            if lat is None or lon is None:
+                continue
+            if len(tasks) >= max_lookups:
+                break
+
+            async def _set_loc(n: Dict[str, Any], la, lo):
+                city = await self._reverse_geocode(la, lo)
+                if city:
+                    n["approx_location"] = city
+
+            tasks.append(_set_loc(node, lat, lon))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _build_nodes_tables(
+        self,
+        title: str,
+        nodes: List[Dict[str, Any]],
+        page_number: int,
+        total_pages: int,
+    ) -> List[str]:
+        """Create plain code-block tables for node listings (telemetry-style)."""
+        header = (
+            f"{'ID':<6} | {'Name':<20} | {'Bat%':>5} | {'Volt':>6} | "
+            f"{'Ch%':>5} | {'Air%':>5} | {'Uptime':>8} | {'Seen':>6} | {'City':<16}"
+        )
+        divider = "-" * len(header)
+        rows = [self._format_node_row(node) for node in nodes]
+        lines = [header, divider] + rows
+        block_lines = lines
+        chunks = self._chunk_lines(block_lines, 1800)
+        return ["```text\n" + "\n".join(chunk) + "\n```" for chunk in chunks]
+
+    def _build_topology_ascii(
+        self, nodes: List[Dict[str, Any]], connections: List[Dict[str, Any]]
+    ) -> List[str]:
+        """Build a multiline ASCII topology view using hops and all known connections."""
+        if not nodes:
+            return ["No nodes available."]
+
+        name_by_id: Dict[str, str] = {}
+        hops_by_id: Dict[str, Optional[int]] = {}
+        last_heard_by_id: Dict[str, Optional[str]] = {}
+        for node in nodes:
+            node_id = str(node.get("node_id") or "")
+            name = (
+                node.get("long_name")
+                or node.get("short_name")
+                or node_id
+                or "Unknown"
+            )
+            name_by_id[node_id] = self._truncate_text(str(name), 20)
+            hop_val = node.get("hops_away")
+            try:
+                hops_by_id[node_id] = int(hop_val) if hop_val is not None else None
+            except Exception:
+                hops_by_id[node_id] = None
+            last_heard_by_id[node_id] = node.get("last_heard")
+
+        # Build adjacency from message-derived connections. Prefer to drop broadcast edges,
+        # but if that leaves us empty, fall back to all edges so the view is never blank.
+        def _build_adj(edge_list):
+            adj: Dict[str, List[Dict[str, Any]]] = {}
+            edges_out = []
+            for conn in edge_list or []:
+                from_id = str(conn.get("from_node") or "")
+                to_id = str(conn.get("to_node") or "")
+                if not from_id or not to_id:
+                    continue
+                msg_count = conn.get("message_count", 0) or 0
+                avg_hops = conn.get("avg_hops", 0) or 0
+                entry = {"node": to_id, "message_count": msg_count, "avg_hops": avg_hops}
+                adj.setdefault(from_id, []).append(entry)
+                entry_rev = {"node": from_id, "message_count": msg_count, "avg_hops": avg_hops}
+                adj.setdefault(to_id, []).append(entry_rev)
+                edges_out.append(
+                    {"from": from_id, "to": to_id, "msg": msg_count, "avg_hops": avg_hops}
+                )
+            return adj, edges_out
+
+        connections_no_broadcast = [
+            c
+            for c in connections or []
+            if not str(c.get("from_node") or "").startswith("^")
+            and not str(c.get("to_node") or "").startswith("^")
+        ]
+        adjacency, filtered_edges = _build_adj(connections_no_broadcast)
+        if not adjacency and connections:
+            adjacency, filtered_edges = _build_adj(connections)
+
+        if not adjacency:
+            return ["No recent connections found."]
+
+        def _degree_score(node_id: str) -> int:
+            return sum(n.get("message_count", 0) or 0 for n in adjacency.get(node_id, []))
+
+        # Roots: prefer the bot's own node_id if known, else any hop 0, else top-degree.
+        roots = []
+        if hasattr(self, "my_node_id") and self.my_node_id:
+            if self.my_node_id in adjacency:
+                roots = [self.my_node_id]
+        if not roots:
+            roots = [nid for nid, hop in hops_by_id.items() if hop == 0 and nid in adjacency]
+        if not roots:
+            roots = sorted(adjacency.keys(), key=_degree_score, reverse=True)[:5]
+
+        # Build probable parent mapping based on hops and message volume
+        parent_for: Dict[str, str] = {}
+        nodes_sorted = sorted(
+            hops_by_id.keys(),
+            key=lambda nid: (
+                hops_by_id.get(nid) if hops_by_id.get(nid) is not None else 999,
+                -_degree_score(nid),
+            ),
+        )
+        for nid in nodes_sorted:
+            if nid in roots:
+                continue
+            best_parent = None
+            best_score = None
+            for edge in adjacency.get(nid, []):
+                neighbor = edge["node"]
+                neighbor_hop = hops_by_id.get(neighbor)
+                node_hop = hops_by_id.get(nid)
+                msg = edge.get("message_count", 0) or 0
+                avg_h = edge.get("avg_hops", 0) or 0
+                # Prefer parents that are closer to root (lower hop), then higher traffic, then lower avg hops
+                hop_rank = 0
+                if neighbor_hop is None or node_hop is None:
+                    hop_rank = 1
+                elif neighbor_hop > node_hop:
+                    hop_rank = 2
+                score = (
+                    hop_rank,
+                    neighbor_hop if neighbor_hop is not None else 99,
+                    -msg,
+                    avg_h,
+                )
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_parent = neighbor
+            if best_parent:
+                parent_for[nid] = best_parent
+
+        children: Dict[str, List[str]] = {}
+        for child, parent in parent_for.items():
+            children.setdefault(parent, []).append(child)
+
+        def _edge_info(a: str, b: str) -> Dict[str, Any]:
+            for edge in adjacency.get(a, []):
+                if edge["node"] == b:
+                    return edge
+            return {}
+
+        lines = ["MESH TOPOLOGY (last 24h)"]
+
+        # Group by hop for clearer Meshtastic-style view
+        hop_groups: Dict[str, List[str]] = {}
+        for nid, hop in hops_by_id.items():
+            key = str(hop) if hop is not None else "?"
+            hop_groups.setdefault(key, []).append(nid)
+
+        for hop in sorted(
+            hop_groups.keys(),
+            key=lambda h: (h == "?", int(h) if h.isdigit() else 999),
+        ):
+            lines.append("")
+            lines.append(f"HOP {hop}")
+            header = (
+                f"{'ID':<5} {'Name':<24} {'Seen':>5} {'Via':<14} {'Msgs':>5} {'AvgH':>5}"
+            )
+            divider = "-" * len(header)
+            lines.append(header)
+            lines.append(divider)
+
+            hop_nodes = sorted(
+                hop_groups[hop],
+                key=lambda nid: (-_degree_score(nid), name_by_id.get(nid, nid)),
+            )
+            for nid in hop_nodes:
+                name = name_by_id.get(nid, nid) or nid
+                short_id = nid[-4:] if len(nid) >= 4 else nid or "--"
+                parent = parent_for.get(nid)
+                edge = _edge_info(nid, parent) if parent else {}
+                msg = edge.get("message_count")
+                avg_h = edge.get("avg_hops")
+
+                via_label = "--"
+                if parent:
+                    via_name = name_by_id.get(parent, parent) or parent
+                    via_label = self._truncate_text(via_name, 14)
+                elif str(hop) == "0":
+                    via_label = "Direct"
+
+                msg_txt = f"{int(msg):>5d}" if msg is not None else "   --"
+                avg_txt = f"{avg_h:>5.1f}" if avg_h is not None else "   --"
+                seen_txt = self._format_age_short(last_heard_by_id.get(nid))
+
+                lines.append(
+                    f"{short_id:<5} {name:<24} {seen_txt:>5} {via_label:<14} {msg_txt} {avg_txt}"
+                )
+
+        # Top links
+        lines.append("")
+        lines.append("")
+        lines.append("Top links (by messages)")
+        top_edges = sorted(filtered_edges, key=lambda e: e.get("msg", 0) or 0, reverse=True)[
+            :12
+        ]
+        if not top_edges:
+            lines.append("None")
+        else:
+            link_header = f"{'From':<24} {'To':<24} {'Msgs':>5} {'AvgH':>5}"
+            lines.append(link_header)
+            lines.append("-" * len(link_header))
+            for edge in top_edges:
+                f_id = edge["from"]
+                t_id = edge["to"]
+                msgs = edge.get("msg", 0) or 0
+                avg_h = edge.get("avg_hops", 0) or 0
+                f_name = name_by_id.get(f_id, f_id) or f_id
+                t_name = name_by_id.get(t_id, t_id) or t_id
+                f_label = self._truncate_text(f"{f_name}({f_id[-4:] or '--'})", 24)
+                t_label = self._truncate_text(f"{t_name}({t_id[-4:] or '--'})", 24)
+                lines.append(
+                    f"{f_label:<24} {t_label:<24} {msgs:>5d} {avg_h:>5.1f}"
+                )
+
+        return lines
 
     def _create_connection_tree(self, nodes, connections):
         """Create readable ASCII tree for Discord showing network topology"""
@@ -3890,6 +5377,242 @@ Connections: {len(connections)} active"""
                 message.channel, f"❌ Error analyzing path: {str(e)[:100]}"
             )
 
+    def _is_admin(self, message: discord.Message) -> bool:
+        try:
+            if message.guild is None:
+                return True
+            perms = getattr(message.author, "guild_permissions", None)
+            if perms is None:
+                return False
+            return bool(perms.administrator or perms.manage_guild)
+        except Exception:
+            return False
+
+    def _parse_timestamp(self, ts: Optional[str]) -> Optional[datetime]:
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            pass
+        try:
+            return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
+    def _format_age(self, ts: Optional[str]) -> str:
+        dt = self._parse_timestamp(ts) if isinstance(ts, str) else ts
+        if not dt:
+            return "unknown"
+        now = datetime.utcnow().replace(tzinfo=dt.tzinfo)
+        delta = now - dt
+        seconds = max(0, int(delta.total_seconds()))
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes}m"
+        hours = minutes // 60
+        if hours < 24:
+            return f"{hours}h"
+        days = hours // 24
+        return f"{days}d"
+
+    def _build_sparkline(self, values: List[float]) -> str:
+        if not values:
+            return ""
+        clean = []
+        for val in values:
+            try:
+                clean.append(float(val))
+            except Exception:
+                continue
+        if not clean:
+            return ""
+        vmin = min(clean)
+        vmax = max(clean)
+        if vmax == vmin:
+            return "-" * len(clean)
+        blocks = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+        span = vmax - vmin
+        chars = []
+        for val in clean:
+            idx = int((val - vmin) / span * (len(blocks) - 1))
+            chars.append(blocks[max(0, min(idx, len(blocks) - 1))])
+        return "".join(chars)
+
+    def _metric_slope_per_hour(self, history: List[Dict[str, Any]]) -> Optional[float]:
+        points = []
+        for entry in history:
+            val = entry.get("value")
+            ts = entry.get("timestamp")
+            dt = self._parse_timestamp(ts) if isinstance(ts, str) else None
+            if dt is None or val is None:
+                continue
+            try:
+                points.append((dt, float(val)))
+            except Exception:
+                continue
+        if len(points) < 2:
+            return None
+        points.sort(key=lambda item: item[0])
+        dt_seconds = (points[-1][0] - points[0][0]).total_seconds()
+        if dt_seconds <= 0:
+            return None
+        return (points[-1][1] - points[0][1]) / (dt_seconds / 3600)
+
+    def _compute_health_score(
+        self,
+        node: Dict[str, Any],
+        message_rate: Optional[float],
+        battery_slope: Optional[float],
+    ) -> Tuple[Optional[float], Dict[str, float]]:
+        weights = HEALTH_SCORE.get("weights", {})
+        score_components = {}
+        weighted = 0.0
+        total_weight = 0.0
+
+        if battery_slope is not None:
+            floor_val = HEALTH_SCORE.get("battery_slope_floor", -5.0)
+            ceil_val = HEALTH_SCORE.get("battery_slope_ceiling", 0.0)
+            if battery_slope <= floor_val:
+                slope_score = 0.0
+            elif battery_slope >= ceil_val:
+                slope_score = 1.0
+            else:
+                slope_score = (battery_slope - floor_val) / (ceil_val - floor_val)
+            score_components["battery_slope"] = slope_score * 100
+            weight = float(weights.get("battery_slope", 0))
+            weighted += slope_score * weight
+            total_weight += weight
+
+        uptime_seconds = node.get("uptime_seconds")
+        if uptime_seconds is not None:
+            try:
+                uptime_hours = float(uptime_seconds) / 3600.0
+                target_hours = float(HEALTH_SCORE.get("uptime_hours_target", 24.0))
+                uptime_score = min(1.0, max(0.0, uptime_hours / target_hours))
+                score_components["uptime"] = uptime_score * 100
+                weight = float(weights.get("uptime", 0))
+                weighted += uptime_score * weight
+                total_weight += weight
+            except Exception:
+                pass
+
+        last_heard = node.get("last_heard")
+        last_dt = self._parse_timestamp(last_heard) if isinstance(last_heard, str) else None
+        if last_dt:
+            age_minutes = (datetime.utcnow() - last_dt.replace(tzinfo=None)).total_seconds() / 60
+            good = float(HEALTH_SCORE.get("last_heard_good_minutes", 10))
+            bad = float(HEALTH_SCORE.get("last_heard_bad_minutes", 120))
+            if age_minutes <= good:
+                heard_score = 1.0
+            elif age_minutes >= bad:
+                heard_score = 0.0
+            else:
+                heard_score = 1.0 - ((age_minutes - good) / (bad - good))
+            score_components["last_heard"] = heard_score * 100
+            weight = float(weights.get("last_heard", 0))
+            weighted += heard_score * weight
+            total_weight += weight
+
+        if message_rate is not None:
+            good_rate = float(HEALTH_SCORE.get("packet_rate_good_per_hour", 10.0))
+            bad_rate = float(HEALTH_SCORE.get("packet_rate_bad_per_hour", 0.0))
+            if message_rate <= bad_rate:
+                rate_score = 0.0
+            elif message_rate >= good_rate:
+                rate_score = 1.0
+            else:
+                rate_score = (message_rate - bad_rate) / (good_rate - bad_rate)
+            score_components["packet_rate"] = rate_score * 100
+            weight = float(weights.get("packet_rate", 0))
+            weighted += rate_score * weight
+            total_weight += weight
+
+        if total_weight <= 0:
+            return None, score_components
+
+        return round((weighted / total_weight) * 100, 1), score_components
+
+    def _haversine_m(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        try:
+            import math
+
+            r = 6371000.0
+            lat1_r = math.radians(lat1)
+            lat2_r = math.radians(lat2)
+            dlat = lat2_r - lat1_r
+            dlon = math.radians(lon2 - lon1)
+            a = (
+                math.sin(dlat / 2) ** 2
+                + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(dlon / 2) ** 2
+            )
+            c = 2 * math.asin(math.sqrt(a))
+            return r * c
+        except Exception:
+            return 0.0
+
+    def _build_static_map_url(self, lat: float, lon: float) -> str:
+        base_url = MAP_SNAPSHOT.get("base_url", "")
+        if not base_url:
+            return ""
+        params = {
+            "center": f"{lat:.5f},{lon:.5f}",
+            "zoom": int(MAP_SNAPSHOT.get("zoom", 13)),
+            "size": MAP_SNAPSHOT.get("size", "600x400"),
+            "markers": f"{lat:.5f},{lon:.5f},{MAP_SNAPSHOT.get('marker_color', 'red')}",
+        }
+        return f"{base_url}?{urlencode(params, safe=',:')}"
+
+    async def _get_map_snapshot(self, lat: float, lon: float) -> Optional[Dict[str, str]]:
+        if not MAP_SNAPSHOT.get("enabled", True):
+            return None
+        url = self._build_static_map_url(lat, lon)
+        if not url:
+            return None
+        if not MAP_SNAPSHOT.get("cache_enabled", True):
+            return {"url": url}
+
+        cache_dir = MAP_SNAPSHOT.get("cache_dir", "data/map_cache")
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except Exception:
+            return {"url": url}
+
+        key = f"{lat:.5f}:{lon:.5f}:{MAP_SNAPSHOT.get('zoom')}:{MAP_SNAPSHOT.get('size')}:{MAP_SNAPSHOT.get('marker_color')}"
+        filename = hashlib.sha1(key.encode("utf-8")).hexdigest() + ".png"
+        path = os.path.join(cache_dir, filename)
+        ttl_hours = float(MAP_SNAPSHOT.get("cache_ttl_hours", 24))
+        if os.path.exists(path):
+            try:
+                age_seconds = time.time() - os.path.getmtime(path)
+                if age_seconds < ttl_hours * 3600:
+                    return {"path": path}
+            except Exception:
+                pass
+
+        timeout = float(MAP_SNAPSHOT.get("timeout_seconds", 5))
+
+        def _download():
+            try:
+                resp = requests.get(url, timeout=timeout)
+                if resp.ok and resp.content:
+                    with open(path, "wb") as handle:
+                        handle.write(resp.content)
+                    return True
+            except Exception:
+                return False
+            return False
+
+        try:
+            ok = await asyncio.to_thread(_download)
+        except Exception:
+            ok = False
+        if ok and os.path.exists(path):
+            return {"path": path}
+        return {"url": url}
+
     async def _safe_send(self, channel, message: str):
         """Safely send a message to a channel with error handling"""
         try:
@@ -3914,6 +5637,7 @@ class DiscordBot(discord.Client):
         self.config = config
         self.meshtastic = meshtastic
         self.database = database
+        self.my_node_id = None
 
         # Queues for communication with size limits to prevent memory exhaustion
         self.mesh_to_discord = queue.Queue(maxsize=1000)  # Limit to 1000 messages
@@ -3925,17 +5649,114 @@ class DiscordBot(discord.Client):
         self.command_handler = CommandHandler(
             meshtastic, self.discord_to_mesh, database
         )
+        self._last_mesh_rx_time = time.time()
+        try:
+            self._watchdog_threshold = max(
+                0,
+                int(getattr(config, "connection_watchdog_minutes", 10)) * 60,
+            )
+        except Exception:
+            self._watchdog_threshold = 600
+        self.command_handler.mesh_to_discord_queue = self.mesh_to_discord
 
         # Background task
         self.bg_task = None
         self.telemetry_task = None
         self.high_altitude_task_handle = None
+        self.db_maintenance_task_handle = None
 
         # Track last telemetry update hour
         self.last_telemetry_hour = datetime.now().hour
 
         # High altitude alert cooldown map: node_id -> last_alert_utc_str
         self._high_alt_alerts = {}
+
+        # Restore persisted queues if configured
+        self._load_persisted_queues()
+
+    def _queue_policy(self, queue_name: str) -> str:
+        policy = QUEUE_PERSISTENCE.get("policy", {})
+        return str(policy.get(queue_name, "drop_old")).lower()
+
+    def _load_persisted_queues(self) -> None:
+        if not QUEUE_PERSISTENCE.get("enabled", True):
+            return
+        path = QUEUE_PERSISTENCE.get("path", "data/queue_state.json")
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as e:
+            logger.warning(f"Failed to load persisted queues: {e}")
+            return
+
+        saved_at = data.get("saved_at")
+        try:
+            age_seconds = time.time() - float(saved_at or 0)
+        except Exception:
+            age_seconds = None
+        max_age = float(QUEUE_PERSISTENCE.get("max_age_seconds", 3600))
+
+        queues = data.get("queues", {})
+        restored = {"discord_to_mesh": 0, "mesh_to_discord": 0}
+        dropped = {"discord_to_mesh": 0, "mesh_to_discord": 0}
+
+        for name, target_queue in (
+            ("discord_to_mesh", self.discord_to_mesh),
+            ("mesh_to_discord", self.mesh_to_discord),
+        ):
+            items = queues.get(name, [])
+            policy = self._queue_policy(name)
+            if policy == "drop":
+                dropped[name] = len(items) if isinstance(items, list) else 0
+                continue
+            if policy == "drop_old" and age_seconds is not None and age_seconds > max_age:
+                dropped[name] = len(items) if isinstance(items, list) else 0
+                continue
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                try:
+                    target_queue.put_nowait(item)
+                    restored[name] += 1
+                except queue.Full:
+                    dropped[name] += 1
+                except Exception:
+                    dropped[name] += 1
+
+        logger.info(
+            "Queue restore complete: discord_to_mesh=%s restored, %s dropped; mesh_to_discord=%s restored, %s dropped",
+            restored["discord_to_mesh"],
+            dropped["discord_to_mesh"],
+            restored["mesh_to_discord"],
+            dropped["mesh_to_discord"],
+        )
+
+    def _save_persisted_queues(self) -> None:
+        if not QUEUE_PERSISTENCE.get("enabled", True):
+            return
+        path = QUEUE_PERSISTENCE.get("path", "data/queue_state.json")
+        if not path:
+            return
+        data = {
+            "saved_at": time.time(),
+            "queues": {
+                "discord_to_mesh": list(self.discord_to_mesh.queue),
+                "mesh_to_discord": list(self.mesh_to_discord.queue),
+            },
+        }
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=True, default=str)
+            logger.info(
+                "Persisted queues: discord_to_mesh=%s, mesh_to_discord=%s",
+                len(data["queues"]["discord_to_mesh"]),
+                len(data["queues"]["mesh_to_discord"]),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to persist queues: {e}")
 
     async def setup_hook(self) -> None:
         """Setup bot when starting"""
@@ -3944,8 +5765,24 @@ class DiscordBot(discord.Client):
         self.high_altitude_task_handle = self.loop.create_task(
             self.high_altitude_task()
         )
+        if DB_MAINTENANCE.get("enabled", True):
+            self.db_maintenance_task_handle = self.loop.create_task(
+                self.db_maintenance_task()
+            )
         # Boot announce suppression window
         self._boot_started_at = time.time()
+        # Capture our own node ID from the Meshtastic interface if available.
+        try:
+            iface = getattr(self.meshtastic, "iface", None)
+            my_info = getattr(iface, "myInfo", None)
+            my_num = getattr(my_info, "my_node_num", None) if my_info else None
+            if my_num is not None:
+                try:
+                    self.my_node_id = f"!{int(my_num):08x}"
+                except Exception:
+                    self.my_node_id = None
+        except Exception:
+            self.my_node_id = None
 
     async def on_ready(self):
         """Called when bot is ready"""
@@ -4116,6 +5953,26 @@ class DiscordBot(discord.Client):
                     sent_counts = {"announcement": 0, "alert": 0, "command_reply": 0}
                     rate_window_start = now
 
+                # Watchdog: reconnect if no mesh packets have been seen recently
+                if (
+                    self._watchdog_threshold
+                    and (now - self._last_mesh_rx_time) > self._watchdog_threshold
+                ):
+                    logger.warning(
+                        "No mesh packets received within watchdog window; attempting reconnect"
+                    )
+                    try:
+                        # Close existing iface if possible
+                        if self.meshtastic.iface:
+                            try:
+                                self.meshtastic.iface.close()
+                            except Exception:
+                                pass
+                        await self.meshtastic.connect()
+                        self._last_mesh_rx_time = time.time()
+                    except Exception as watchdog_err:
+                        logger.error(f"Watchdog reconnect failed: {watchdog_err}")
+
                 await asyncio.sleep(1)  # Check every second
 
             except Exception as e:
@@ -4148,7 +6005,13 @@ class DiscordBot(discord.Client):
                 threshold_min = 60
                 hysteresis = 2.0
             # Fetch nodes
-            nodes = self.database.get_all_nodes(limit=1000) if self.database else []
+            nodes = (
+                await asyncio.to_thread(
+                    self.database.get_presence_snapshot, 1000
+                )
+                if self.database
+                else []
+            )
             now_utc = datetime.utcnow()
             online_cutoff = now_utc - timedelta(minutes=threshold_min)
             offline_cutoff = now_utc - timedelta(
@@ -4156,6 +6019,8 @@ class DiscordBot(discord.Client):
             )
             for n in nodes:
                 node_id = n.get("node_id")
+                if not node_id:
+                    continue
                 last_heard = n.get("last_heard")
                 prev_state = (n.get("presence_state") or "").lower()
                 # Compute new state
@@ -4181,25 +6046,31 @@ class DiscordBot(discord.Client):
                 if new_state != prev_state:
                     # Update DB state
                     try:
-                        with self.database._get_connection() as conn:
-                            cur = conn.cursor()
-                            cur.execute(
-                                "UPDATE nodes SET presence_state = ? WHERE node_id = ?",
-                                (new_state, node_id),
-                            )
-                            conn.commit()
+                        await asyncio.to_thread(
+                            self.database.update_presence_state, node_id, new_state
+                        )
                     except Exception as upd_err:
                         logger.debug(
                             f"Presence state update failed for {node_id}: {upd_err}"
                         )
                     # Announce transitions (dedupe via alerts table)
+                    if not getattr(
+                        self.config, "presence_announcements_enabled", True
+                    ):
+                        continue
                     try:
                         alert_type = f"presence_{new_state}"
-                        if hasattr(
-                            self.database, "recent_alert_exists"
-                        ) and not self.database.recent_alert_exists(
-                            node_id, alert_type, minutes=threshold_min
-                        ):
+                        recent = (
+                            await asyncio.to_thread(
+                                self.database.recent_alert_exists,
+                                node_id,
+                                alert_type,
+                                threshold_min,
+                            )
+                            if hasattr(self.database, "recent_alert_exists")
+                            else True
+                        )
+                        if not recent:
                             name = n.get("long_name") or node_id
                             emoji = (
                                 "🟢"
@@ -4215,7 +6086,9 @@ class DiscordBot(discord.Client):
                             if ch:
                                 await ch.send(msg)
                             if hasattr(self.database, "record_alert"):
-                                self.database.record_alert(node_id, alert_type)
+                                await asyncio.to_thread(
+                                    self.database.record_alert, node_id, alert_type
+                                )
                     except Exception as ann_err:
                         logger.debug(
                             f"Presence announce failed for {node_id}: {ann_err}"
@@ -4241,6 +6114,76 @@ class DiscordBot(discord.Client):
             except Exception as e:
                 logger.error(f"Error in telemetry update task: {e}")
                 await asyncio.sleep(60)
+
+    async def db_maintenance_task(self):
+        """Periodic DB backup and WAL maintenance."""
+        await self.wait_until_ready()
+        last_backup = 0.0
+        last_checkpoint = 0.0
+        last_cleanup = 0.0
+
+        backup_interval = float(DB_MAINTENANCE.get("backup_interval_hours", 24)) * 3600
+        checkpoint_interval = float(
+            DB_MAINTENANCE.get("wal_checkpoint_interval_hours", 6)
+        ) * 3600
+        cleanup_days = int(DB_MAINTENANCE.get("cleanup_retention_days", 30))
+        cleanup_interval = 24 * 3600
+        backup_dir = DB_MAINTENANCE.get("backup_dir", "data/backups")
+        retention_days = int(DB_MAINTENANCE.get("backup_retention_days", 7))
+
+        while not self.is_closed():
+            now = time.time()
+            try:
+                if backup_interval > 0 and now - last_backup >= backup_interval:
+                    try:
+                        os.makedirs(backup_dir, exist_ok=True)
+                        ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+                        backup_path = os.path.join(
+                            backup_dir, f"meshtastic-{ts}.db"
+                        )
+                        ok = await asyncio.to_thread(
+                            self.database.backup_database, backup_path
+                        )
+                        if ok:
+                            last_backup = now
+                            logger.info(f"DB backup created: {backup_path}")
+                    except Exception as backup_err:
+                        logger.warning(f"DB backup failed: {backup_err}")
+
+                    if retention_days > 0:
+                        cutoff = now - (retention_days * 86400)
+                        try:
+                            for name in os.listdir(backup_dir):
+                                path = os.path.join(backup_dir, name)
+                                if not os.path.isfile(path):
+                                    continue
+                                if os.path.getmtime(path) < cutoff:
+                                    os.remove(path)
+                        except Exception as prune_err:
+                            logger.warning(f"Backup pruning failed: {prune_err}")
+
+                if checkpoint_interval > 0 and now - last_checkpoint >= checkpoint_interval:
+                    try:
+                        ok = await asyncio.to_thread(self.database.checkpoint_wal)
+                        if ok:
+                            last_checkpoint = now
+                            logger.info("WAL checkpoint completed")
+                    except Exception as ck_err:
+                        logger.warning(f"WAL checkpoint failed: {ck_err}")
+
+                if cleanup_days > 0 and now - last_cleanup >= cleanup_interval:
+                    try:
+                        await asyncio.to_thread(
+                            self.database.cleanup_old_data, cleanup_days
+                        )
+                        last_cleanup = now
+                    except Exception as cleanup_err:
+                        logger.warning(f"DB cleanup failed: {cleanup_err}")
+
+            except Exception as loop_err:
+                logger.warning(f"DB maintenance loop error: {loop_err}")
+
+            await asyncio.sleep(60)
 
     async def _process_nodes(self, channel):
         """Process and store nodes, announce new ones"""
@@ -4479,12 +6422,13 @@ class DiscordBot(discord.Client):
                             from_name = item.get(
                                 "from_name", item.get("from_id", "Unknown")
                             )
-                            distance_moved = item.get("distance_moved", 0)
+                            distance_moved = item.get("distance_moved")
                             old_lat = item.get("old_lat", 0)
                             old_lon = item.get("old_lon", 0)
                             new_lat = item.get("new_lat", 0)
                             new_lon = item.get("new_lon", 0)
                             new_alt = item.get("new_alt", 0)
+                            speed_mps = item.get("speed_mps")
 
                             # Format coordinates for display
                             old_coords = f"{old_lat:.6f}, {old_lon:.6f}"
@@ -4499,14 +6443,30 @@ class DiscordBot(discord.Client):
                             )
 
                             # Add movement details
-                            movement_text = (
-                                f"**Distance:** {distance_moved:.1f} meters\n"
-                            )
-                            movement_text += f"**From:** `{old_coords}`\n"
-                            movement_text += f"**To:** `{new_coords}`"
-
+                            movement_lines = []
+                            if distance_moved is not None:
+                                try:
+                                    movement_lines.append(
+                                        f"**Distance:** {float(distance_moved):.1f} meters"
+                                    )
+                                except Exception:
+                                    pass
+                            if speed_mps is not None:
+                                try:
+                                    movement_lines.append(
+                                        f"**Speed:** {float(speed_mps):.1f} m/s"
+                                    )
+                                except Exception:
+                                    pass
+                            if old_lat != 0 or old_lon != 0:
+                                movement_lines.append(f"**From:** `{old_coords}`")
+                            if new_lat != 0 or new_lon != 0:
+                                movement_lines.append(f"**To:** `{new_coords}`")
                             if new_alt != 0:
-                                movement_text += f"\n**Altitude:** {new_alt}m"
+                                movement_lines.append(f"**Altitude:** {new_alt}m")
+                            if not movement_lines:
+                                movement_lines.append("Movement detected from position update")
+                            movement_text = "\n".join(movement_lines)
 
                             embed.add_field(
                                 name="📍 Movement Details",
@@ -4515,17 +6475,57 @@ class DiscordBot(discord.Client):
                             )
 
                             # Add a fun movement indicator
-                            if distance_moved > 1000:
-                                embed.add_field(
-                                    name="🏃 Speed", value="Moving fast!", inline=True
-                                )
-                            elif distance_moved > 500:
-                                embed.add_field(
-                                    name="🚶 Speed", value="Walking pace", inline=True
-                                )
+                            speed_val = None
+                            try:
+                                if speed_mps is not None:
+                                    speed_val = float(speed_mps)
+                            except Exception:
+                                speed_val = None
+
+                            dist_val = None
+                            try:
+                                if distance_moved is not None:
+                                    dist_val = float(distance_moved)
+                            except Exception:
+                                dist_val = None
+
+                            if speed_val is not None:
+                                if speed_val > 5:
+                                    embed.add_field(
+                                        name="🏃 Speed", value="Moving fast!", inline=True
+                                    )
+                                elif speed_val > 1:
+                                    embed.add_field(
+                                        name="🚶 Speed", value="On the move", inline=True
+                                    )
+                                else:
+                                    embed.add_field(
+                                        name="🐌 Speed", value="Slow movement", inline=True
+                                    )
+                            elif dist_val is not None and dist_val > 0:
+                                if dist_val > 1000:
+                                    embed.add_field(
+                                        name="🏃 Speed",
+                                        value="Moving fast!",
+                                        inline=True,
+                                    )
+                                elif dist_val > 500:
+                                    embed.add_field(
+                                        name="🚶 Speed",
+                                        value="Walking pace",
+                                        inline=True,
+                                    )
+                                else:
+                                    embed.add_field(
+                                        name="🐌 Speed",
+                                        value="Slow movement",
+                                        inline=True,
+                                    )
                             else:
                                 embed.add_field(
-                                    name="🐌 Speed", value="Slow movement", inline=True
+                                    name="🚶 Status",
+                                    value="Movement detected",
+                                    inline=True,
                                 )
 
                             embed.set_footer(text=f"Movement detected at")
@@ -4644,6 +6644,9 @@ class DiscordBot(discord.Client):
             if "decoded" not in packet:
                 logger.debug("Received packet without decoded data")
                 return
+
+            # Update watchdog timestamp
+            self._last_mesh_rx_time = time.time()
 
             portnum = packet["decoded"]["portnum"]
             from_id = packet.get("fromId", "Unknown")
@@ -4776,6 +6779,12 @@ class DiscordBot(discord.Client):
 
             # Handle telemetry packets
             elif portnum == "TELEMETRY_APP":
+                try:
+                    logger.info(
+                        f"DEBUG TELEMETRY decoded: {str(packet.get('decoded'))[:800]}"
+                    )
+                except Exception:
+                    pass
                 if from_id and from_id != "Unknown" and from_id is not None:
                     logger.info(
                         f"📊 TELEMETRY: Processing sensor data from {from_name}"
@@ -4807,6 +6816,12 @@ class DiscordBot(discord.Client):
 
             # Handle position packets
             elif portnum == "POSITION_APP":
+                try:
+                    logger.info(
+                        f"DEBUG POSITION decoded: {str(packet.get('decoded'))[:800]}"
+                    )
+                except Exception:
+                    pass
                 logger.info(f"📍 POSITION: Location update from {from_name}")
                 self._process_position_packet(packet)
                 # Record position packets in the messages table for topology tracking.
@@ -4836,6 +6851,11 @@ class DiscordBot(discord.Client):
             elif portnum == "ROUTING_APP":
                 logger.info(f"🛣️ ROUTING: Processing traceroute from {from_name}")
                 self._process_routing_packet(packet)
+
+            # Handle neighbor info packets (topology hints)
+            elif portnum == "NEIGHBORINFO_APP":
+                logger.info(f"🤝 NEIGHBORS: Processing neighbor info from {from_name}")
+                self._process_neighborinfo_packet(packet)
 
             # Handle admin packets
             elif portnum == "ADMIN_APP":
@@ -4892,10 +6912,16 @@ class DiscordBot(discord.Client):
                 env_metrics = telemetry_data["environmentMetrics"]
                 if env_metrics.get("temperature") is not None:
                     extracted_data["temperature"] = env_metrics["temperature"]
+                # Accept either relativeHumidity or humidity keys
                 if env_metrics.get("relativeHumidity") is not None:
                     extracted_data["humidity"] = env_metrics["relativeHumidity"]
+                elif env_metrics.get("humidity") is not None:
+                    extracted_data["humidity"] = env_metrics["humidity"]
+                # Accept either barometricPressure or pressure keys
                 if env_metrics.get("barometricPressure") is not None:
                     extracted_data["pressure"] = env_metrics["barometricPressure"]
+                elif env_metrics.get("pressure") is not None:
+                    extracted_data["pressure"] = env_metrics["pressure"]
                 if env_metrics.get("gasResistance") is not None:
                     extracted_data["gas_resistance"] = env_metrics["gasResistance"]
 
@@ -4929,6 +6955,22 @@ class DiscordBot(discord.Client):
             if packet.get("frequency") is not None:
                 extracted_data["frequency"] = packet["frequency"]
 
+            # Position data that can be embedded in telemetry
+            pos_obj = telemetry_data.get("position") or {}
+            lat = pos_obj.get("latitude") or pos_obj.get("latitude_i")
+            lon = pos_obj.get("longitude") or pos_obj.get("longitude_i")
+            alt = pos_obj.get("altitude")
+            if lat is not None and lon is not None:
+                try:
+                    lat_f = float(lat) / (1e7 if "latitude_i" in pos_obj else 1.0)
+                    lon_f = float(lon) / (1e7 if "longitude_i" in pos_obj else 1.0)
+                    extracted_data["latitude"] = lat_f
+                    extracted_data["longitude"] = lon_f
+                    if alt is not None:
+                        extracted_data["altitude"] = float(alt)
+                except Exception:
+                    pass
+
             # Store telemetry data if we have any
             if extracted_data:
                 try:
@@ -4937,6 +6979,31 @@ class DiscordBot(discord.Client):
                         logger.info(
                             f"Stored telemetry data for {from_id}: {list(extracted_data.keys())}"
                         )
+                        # Store position if telemetry carried location
+                        if (
+                            extracted_data.get("latitude") is not None
+                            and extracted_data.get("longitude") is not None
+                        ):
+                            try:
+                                self.database.add_position(
+                                    from_id,
+                                    {
+                                        "latitude": extracted_data.get("latitude"),
+                                        "longitude": extracted_data.get("longitude"),
+                                        "altitude": extracted_data.get("altitude"),
+                                        "speed": None,
+                                        "heading": None,
+                                        "accuracy": None,
+                                        "source": "telemetry",
+                                    },
+                                )
+                                logger.debug(
+                                    f"Stored position from telemetry for {from_id}"
+                                )
+                            except Exception as pos_err:
+                                logger.error(
+                                    f"Error storing telemetry-derived position for {from_id}: {pos_err}"
+                                )
 
                         # Add telemetry to live monitor buffer
                         if from_id and from_id != "Unknown" and from_id is not None:
@@ -5125,32 +7192,213 @@ class DiscordBot(discord.Client):
         except Exception as e:
             logger.error(f"Error processing routing packet: {e}")
 
+    def _process_neighborinfo_packet(self, packet):
+        """Process neighbor info packets and log edges for topology."""
+        try:
+            from_id = packet.get("fromId", "Unknown")
+            decoded = packet.get("decoded", {}) or {}
+
+            neighbors_obj = (
+                decoded.get("neighborinfo")
+                or decoded.get("neighborInfo")
+                or decoded.get("neighbors")
+            )
+            if isinstance(neighbors_obj, dict) and "neighbors" in neighbors_obj:
+                neighbors_obj = neighbors_obj.get("neighbors")
+
+            if not neighbors_obj or not isinstance(neighbors_obj, (list, tuple)):
+                logger.debug(f"No neighbor list in packet from {from_id}")
+                return
+
+            def _normalize_node_id(val):
+                if val is None:
+                    return None
+                try:
+                    if isinstance(val, str):
+                        return val if val.startswith("!") else val
+                    return f"!{int(val):08x}"
+                except Exception:
+                    try:
+                        return str(val)
+                    except Exception:
+                        return None
+
+            for nb in neighbors_obj:
+                if not isinstance(nb, dict):
+                    continue
+                nb_id_raw = (
+                    nb.get("nodeId")
+                    or nb.get("nodeid")
+                    or nb.get("id")
+                    or nb.get("node")
+                    or nb.get("num")
+                )
+                nb_id = _normalize_node_id(nb_id_raw)
+                if not nb_id:
+                    continue
+                snr = nb.get("snr")
+                rssi = nb.get("rssi")
+                hops_away = nb.get("hopsAway") or nb.get("hops")
+                try:
+                    if self.database:
+                        self.database.add_message(
+                            {
+                                "from_node_id": from_id,
+                                "to_node_id": nb_id,
+                                "message_text": None,
+                                "port_num": "NEIGHBORINFO_APP",
+                                "payload": str(nb),
+                                "hops_away": hops_away if hops_away is not None else 0,
+                                "snr": snr,
+                                "rssi": rssi,
+                            }
+                        )
+                except Exception as nb_err:
+                    logger.error(f"Error storing neighbor info for {from_id}->{nb_id}: {nb_err}")
+            logger.info(f"Stored neighbor info edges from {from_id}")
+
+        except Exception as e:
+            logger.error(f"Error processing neighborinfo packet: {e}")
+
     def _process_position_packet(self, packet):
         """Process position packet and detect movement"""
         try:
             from_id = packet.get("fromId", "Unknown")
             decoded = packet.get("decoded", {})
-            position_data = decoded.get("position", {})
+            position_data = decoded.get("position", {}) or {}
 
             if not position_data:
-                logger.debug(f"No position data in packet from {from_id}")
+                # Some firmware uses lat/lon at top-level decoded
+                top_lat = decoded.get("latitude")
+                top_lon = decoded.get("longitude")
+                top_alt = decoded.get("altitude")
+                if top_lat is not None and top_lon is not None:
+                    position_data = {
+                        "latitude": top_lat,
+                        "longitude": top_lon,
+                        "altitude": top_alt,
+                        "speed": decoded.get("speed"),
+                        "ground_track": decoded.get("ground_track"),
+                        "precision_bits": decoded.get("precision_bits"),
+                    }
+                else:
+                    logger.debug(f"No position data in packet from {from_id}")
+                    return
+
+            # Extract position coordinates with fallbacks
+            def _coord(val, scale=None):
+                if val is None:
+                    return None
+                try:
+                    val = float(val)
+                    if scale:
+                        val = val / scale
+                    return val
+                except Exception:
+                    return None
+
+            new_lat = _coord(position_data.get("latitude"))
+            if new_lat is None:
+                new_lat = _coord(position_data.get("latitude_i"), scale=1e7)
+            new_lon = _coord(position_data.get("longitude"))
+            if new_lon is None:
+                new_lon = _coord(position_data.get("longitude_i"), scale=1e7)
+            new_alt = _coord(position_data.get("altitude")) or 0
+            speed_mps = _coord(position_data.get("speed"))
+            if speed_mps is None:
+                speed_mps = _coord(position_data.get("groundSpeed"))
+            if speed_mps is None:
+                speed_mps = _coord(position_data.get("ground_speed"))
+            if speed_mps is not None and speed_mps < 0:
+                speed_mps = None
+            heading_val = position_data.get("ground_track")
+            if heading_val is None:
+                heading_val = position_data.get("groundTrack")
+
+            # Skip if coordinates are invalid
+            if new_lat is None or new_lon is None:
+                logger.debug(f"Invalid/missing position coordinates from {from_id}")
                 return
-
-            # Extract position coordinates
-            new_lat = (
-                position_data.get("latitude_i", 0) / 1e7
-            )  # Convert from integer to float
-            new_lon = position_data.get("longitude_i", 0) / 1e7
-            new_alt = position_data.get("altitude", 0)
-
-            # Skip if coordinates are invalid (0,0)
             if new_lat == 0 and new_lon == 0:
                 logger.debug(f"Invalid position coordinates (0,0) from {from_id}")
                 return
 
+            def enqueue_movement(
+                distance_val: float,
+                speed_val: Optional[float],
+                old_lat: Optional[float],
+                old_lon: Optional[float],
+            ):
+                from_name = (
+                    self.database.get_node_display_name(from_id)
+                    if self.database
+                    else from_id
+                )
+
+                movement_payload = {
+                    "type": "movement",
+                    "from_id": from_id,
+                    "from_name": from_name,
+                    "distance_moved": distance_val,
+                    "speed_mps": speed_val,
+                    "old_lat": old_lat if old_lat is not None else 0,
+                    "old_lon": old_lon if old_lon is not None else 0,
+                    "new_lat": new_lat,
+                    "new_lon": new_lon,
+                    "new_alt": new_alt,
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                }
+
+                # Queue for Discord
+                try:
+                    self.mesh_to_discord.put_nowait(movement_payload)
+                except queue.Full:
+                    logger.warning(
+                        "Mesh to Discord queue is full, dropping movement notification"
+                    )
+                    try:
+                        self.mesh_to_discord.get_nowait()
+                        self.mesh_to_discord.put_nowait(movement_payload)
+                    except queue.Empty:
+                        pass
+
+                log_parts = []
+                if distance_val is not None:
+                    try:
+                        log_parts.append(f"{float(distance_val):.1f}m")
+                    except Exception:
+                        pass
+                if speed_val is not None:
+                    try:
+                        log_parts.append(f"{float(speed_val):.1f}m/s")
+                    except Exception:
+                        pass
+                log_suffix = f" ({', '.join(log_parts)})" if log_parts else ""
+                logger.info(f"🚶 MOVEMENT: {from_name} on the move{log_suffix}")
+
+                # Add to live monitor buffer
+                if hasattr(self, "command_handler"):
+                    movement_packet_info = {
+                        "type": "movement",
+                        "portnum": "POSITION_APP",
+                        "from_name": from_name,
+                        "from_id": from_id,
+                        "distance_moved": distance_val,
+                        "speed_mps": speed_val,
+                        "hops": 0,
+                        "snr": "N/A",
+                        "rssi": "N/A",
+                    }
+                    self.command_handler.add_packet_to_buffer(movement_packet_info)
+
             # Get last known position from database
             if self.database:
                 last_position = self.database.get_last_position(from_id)
+
+                last_lat = None
+                last_lon = None
+                distance_moved = None
+                movement_notified = False
 
                 if last_position:
                     last_lat = last_position.get("latitude", 0)
@@ -5166,59 +7414,24 @@ class DiscordBot(discord.Client):
                         movement_threshold = 100.0
 
                         if distance_moved > movement_threshold:
-                            # Node has moved significantly!
-                            from_name = (
-                                self.database.get_node_display_name(from_id)
-                                if self.database
-                                else from_id
+                            enqueue_movement(
+                                distance_moved, speed_mps, last_lat, last_lon
                             )
+                            movement_notified = True
 
-                            # Create movement notification
-                            movement_payload = {
-                                "type": "movement",
-                                "from_id": from_id,
-                                "from_name": from_name,
-                                "distance_moved": distance_moved,
-                                "old_lat": last_lat,
-                                "old_lon": last_lon,
-                                "new_lat": new_lat,
-                                "new_lon": new_lon,
-                                "new_alt": new_alt,
-                                "timestamp": datetime.utcnow().isoformat() + "Z",
-                            }
-
-                            # Queue for Discord
-                            try:
-                                self.mesh_to_discord.put_nowait(movement_payload)
-                            except queue.Full:
-                                logger.warning(
-                                    "Mesh to Discord queue is full, dropping movement notification"
-                                )
-                                # Movement notifications are important, so try to make room
-                                try:
-                                    self.mesh_to_discord.get_nowait()
-                                    self.mesh_to_discord.put_nowait(movement_payload)
-                                except queue.Empty:
-                                    pass
-                            logger.info(
-                                f"🚶 MOVEMENT: {from_name} moved {distance_moved:.1f}m from last position"
-                            )
-
-                            # Add to live monitor buffer
-                            if hasattr(self, "command_handler"):
-                                movement_packet_info = {
-                                    "type": "movement",
-                                    "portnum": "POSITION_APP",
-                                    "from_name": from_name,
-                                    "from_id": from_id,
-                                    "distance_moved": distance_moved,
-                                    "hops": 0,
-                                    "snr": "N/A",
-                                    "rssi": "N/A",
-                                }
-                                self.command_handler.add_packet_to_buffer(
-                                    movement_packet_info
-                                )
+                # Speed-only trigger if node is reporting movement but hasn't crossed distance threshold
+                if (
+                    not movement_notified
+                    and speed_mps is not None
+                    and speed_mps > 1.0
+                ):
+                    enqueue_movement(
+                        distance_moved if distance_moved is not None else 0.0,
+                        speed_mps,
+                        last_lat,
+                        last_lon,
+                    )
+                    movement_notified = True
 
             # Store new position in database
             if self.database:
@@ -5227,8 +7440,8 @@ class DiscordBot(discord.Client):
                         "latitude": new_lat,
                         "longitude": new_lon,
                         "altitude": new_alt,
-                        "speed": position_data.get("speed", 0),
-                        "heading": position_data.get("ground_track", 0),
+                        "speed": speed_mps if speed_mps is not None else 0,
+                        "heading": heading_val if heading_val is not None else 0,
                         "accuracy": position_data.get("precision_bits", 0),
                         "source": "meshtastic",
                     }
@@ -5265,18 +7478,17 @@ class DiscordBot(discord.Client):
                 except Exception:
                     threshold_m = 1500
                     cooldown_min = 180
-                cooldown_secs = cooldown_min * 60
-                now_ts = time.time()
 
                 if self.database and channel:
-                    nodes = self.database.get_all_nodes(limit=500)
+                    nodes = await asyncio.to_thread(
+                        self.database.get_nodes_with_latest_positions, 500
+                    )
                     for n in nodes:
                         node_id = n.get("node_id")
-                        long_name = n.get("long_name") or node_id
-                        pos = self.database.get_last_position(node_id)
-                        if not pos:
+                        if not node_id:
                             continue
-                        altitude = pos.get("altitude")
+                        long_name = n.get("long_name") or node_id
+                        altitude = n.get("altitude")
                         if altitude is None:
                             continue
                         if isinstance(altitude, str):
@@ -5285,55 +7497,61 @@ class DiscordBot(discord.Client):
                             except Exception:
                                 continue
                         if altitude >= float(threshold_m):
-                            # DB-backed cooldown
-                            if (
-                                hasattr(self.database, "recent_alert_exists")
-                                and self.database.recent_alert_exists(
-                                    node_id, "high_altitude", cooldown_min
+                            recent = (
+                                await asyncio.to_thread(
+                                    self.database.recent_alert_exists,
+                                    node_id,
+                                    "high_altitude",
+                                    cooldown_min,
                                 )
-                                is False
-                            ):
-                                try:
-                                    embed = discord.Embed(
-                                        title="✈️ High Altitude Node Detected",
-                                        description=f"**{long_name}** appears to be at high altitude",
-                                        color=0x00FF00,
-                                        timestamp=get_utc_time(),
-                                    )
+                                if hasattr(self.database, "recent_alert_exists")
+                                else True
+                            )
+                            if recent:
+                                continue
+                            try:
+                                embed = discord.Embed(
+                                    title="✈️ High Altitude Node Detected",
+                                    description=f"**{long_name}** appears to be at high altitude",
+                                    color=0x00FF00,
+                                    timestamp=get_utc_time(),
+                                )
+                                embed.add_field(
+                                    name="Altitude (m)",
+                                    value=f"{altitude:.0f}",
+                                    inline=True,
+                                )
+                                ts = n.get("timestamp")
+                                if ts:
                                     embed.add_field(
-                                        name="Altitude (m)",
-                                        value=f"{altitude:.0f}",
+                                        name="Last Update",
+                                        value=str(ts),
                                         inline=True,
                                     )
-                                    ts = pos.get("timestamp")
-                                    if ts:
-                                        embed.add_field(
-                                            name="Last Update",
-                                            value=str(ts),
-                                            inline=True,
-                                        )
-                                    lat = pos.get("latitude")
-                                    lon = pos.get("longitude")
-                                    if lat is not None and lon is not None:
-                                        embed.add_field(
-                                            name="Location",
-                                            value=f"{lat:.5f}, {lon:.5f}",
-                                            inline=True,
-                                        )
-                                        embed.add_field(
-                                            name="Map",
-                                            value=f"https://maps.google.com/?q={lat},{lon}",
-                                            inline=True,
-                                        )
-                                    await channel.send(embed=embed)
-                                    if hasattr(self.database, "record_alert"):
-                                        self.database.record_alert(
-                                            node_id, "high_altitude"
-                                        )
-                                except Exception as send_err:
-                                    logger.error(
-                                        f"Failed to send high altitude alert for {node_id}: {send_err}"
+                                lat = n.get("latitude")
+                                lon = n.get("longitude")
+                                if lat is not None and lon is not None:
+                                    embed.add_field(
+                                        name="Location",
+                                        value=f"{lat:.5f}, {lon:.5f}",
+                                        inline=True,
                                     )
+                                    embed.add_field(
+                                        name="Map",
+                                        value=f"https://maps.google.com/?q={lat},{lon}",
+                                        inline=True,
+                                    )
+                                await channel.send(embed=embed)
+                                if hasattr(self.database, "record_alert"):
+                                    await asyncio.to_thread(
+                                        self.database.record_alert,
+                                        node_id,
+                                        "high_altitude",
+                                    )
+                            except Exception as send_err:
+                                logger.error(
+                                    f"Failed to send high altitude alert for {node_id}: {send_err}"
+                                )
                 await asyncio.sleep(60)
             except Exception as e:
                 logger.error(f"Error in high_altitude_task: {e}")
@@ -5373,6 +7591,10 @@ class DiscordBot(discord.Client):
         """Clean shutdown of the bot"""
         try:
             logger.info("Shutting down bot...")
+            try:
+                self._save_persisted_queues()
+            except Exception as save_err:
+                logger.warning(f"Queue persistence failed: {save_err}")
 
             # Close database connections
             if hasattr(self.database, "close_connections"):
@@ -5410,6 +7632,16 @@ class DiscordBot(discord.Client):
                 except asyncio.CancelledError:
                     pass
 
+            if (
+                self.db_maintenance_task_handle
+                and not self.db_maintenance_task_handle.done()
+            ):
+                self.db_maintenance_task_handle.cancel()
+                try:
+                    await self.db_maintenance_task_handle
+                except asyncio.CancelledError:
+                    pass
+
             # Close Discord connection
             await super().close()
             logger.info("Bot shutdown complete")
@@ -5422,12 +7654,38 @@ class DiscordBot(discord.Client):
 def main():
     """Main function to run the bot"""
     try:
+        def _env_or_none(*names):
+            for name in names:
+                value = os.getenv(name)
+                if value is not None:
+                    value = value.strip()
+                    if value:
+                        return value
+            return None
+
+        def _env_int(name: str) -> Optional[int]:
+            value = _env_or_none(name)
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except ValueError:
+                logger.warning(f"Invalid integer for {name}: {value!r}")
+                return None
+
         # Load configuration
-        config = Config(
-            discord_token=os.getenv("DISCORD_TOKEN"),
-            channel_id=int(os.getenv("DISCORD_CHANNEL_ID", "0")),
-            meshtastic_hostname=os.getenv("MESHTASTIC_HOSTNAME"),
-        )
+        config_kwargs = {
+            "discord_token": os.getenv("DISCORD_TOKEN"),
+            "channel_id": int(os.getenv("DISCORD_CHANNEL_ID", "0")),
+            "meshtastic_hostname": _env_or_none("MESHTASTIC_HOSTNAME"),
+            "meshtastic_serial_port": _env_or_none(
+                "MESHTASTIC_SERIAL_PORT", "MESHTASTIC_PORT"
+            ),
+        }
+        alert_channel_id = _env_int("ALERT_CHANNEL_ID")
+        if alert_channel_id is not None:
+            config_kwargs["alert_channel_id"] = alert_channel_id
+        config = Config(**config_kwargs)
 
         # Validate configuration
         if not config.discord_token:
@@ -5451,7 +7709,7 @@ def main():
         # Create Meshtastic interface
         try:
             meshtastic_interface = MeshtasticInterface(
-                config.meshtastic_hostname, database
+                config.meshtastic_hostname, database, serial_port=config.meshtastic_serial_port
             )
             logger.info("Meshtastic interface created successfully")
         except Exception as mesh_error:
