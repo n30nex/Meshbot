@@ -946,7 +946,6 @@ class MeshtasticDatabase:
                             altitude,
                             speed,
                             heading,
-                            timestamp,
                             ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY timestamp DESC) as rn
                         FROM positions
                     )
@@ -965,8 +964,7 @@ class MeshtasticDatabase:
                         p.longitude,
                         p.altitude,
                         p.speed,
-                        p.heading,
-                        p.timestamp as position_ts
+                        p.heading
                     FROM nodes n
                     LEFT JOIN latest_telemetry t ON n.node_id = t.node_id AND t.rn = 1
                     LEFT JOIN latest_positions p ON n.node_id = p.node_id AND p.rn = 1
@@ -1192,94 +1190,6 @@ class MeshtasticDatabase:
             logger.error(f"Error getting telemetry history: {e}")
             return []
 
-    def get_presence_snapshot(self, limit: int = 1000) -> List[Dict[str, Any]]:
-        """Return lightweight presence data to evaluate online/offline state."""
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT node_id, long_name, last_heard, presence_state
-                    FROM nodes
-                    ORDER BY datetime(last_heard) DESC
-                    LIMIT ?
-                """,
-                    (limit,),
-                )
-                columns = [description[0] for description in cursor.description]
-                rows = cursor.fetchall()
-                return [dict(zip(columns, row)) for row in rows]
-        except sqlite3.Error as e:
-            logger.error(f"Database error getting presence snapshot: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Unexpected error getting presence snapshot: {e}")
-            return []
-
-    def update_presence_state(self, node_id: str, new_state: str) -> bool:
-        """Persist a presence state transition."""
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE nodes SET presence_state = ? WHERE node_id = ?",
-                    (new_state, node_id),
-                )
-                return cursor.rowcount > 0
-        except sqlite3.Error as e:
-            logger.error(f"Database error updating presence for {node_id}: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error updating presence for {node_id}: {e}")
-            return False
-
-    def get_nodes_with_latest_positions(
-        self, limit: int = 500
-    ) -> List[Dict[str, Any]]:
-        """Return nodes with their most recent position to avoid per-node queries."""
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    WITH latest_positions AS (
-                        SELECT
-                            node_id,
-                            latitude,
-                            longitude,
-                            altitude,
-                            timestamp,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY node_id
-                                ORDER BY timestamp DESC
-                            ) as rn
-                        FROM positions
-                    )
-                    SELECT
-                        n.node_id,
-                        n.long_name,
-                        lp.latitude,
-                        lp.longitude,
-                        lp.altitude,
-                        lp.timestamp
-                    FROM nodes n
-                    LEFT JOIN latest_positions lp
-                        ON n.node_id = lp.node_id AND lp.rn = 1
-                    ORDER BY datetime(lp.timestamp) DESC
-                    LIMIT ?
-                """,
-                    (limit,),
-                )
-                columns = [description[0] for description in cursor.description]
-                rows = cursor.fetchall()
-                return [dict(zip(columns, row)) for row in rows]
-        except sqlite3.Error as e:
-            logger.error(f"Database error getting latest positions: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Unexpected error getting latest positions: {e}")
-            return []
-
     def get_network_topology(self) -> Dict[str, Any]:
         """Get network topology information"""
         try:
@@ -1400,141 +1310,6 @@ class MeshtasticDatabase:
         except Exception as e:
             logger.error(f"Error getting message statistics: {e}")
             return {}
-
-    def get_db_health(self) -> Dict[str, Any]:
-        """Return counts and last timestamps for key tables."""
-        try:
-            with self._get_connection() as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM nodes")
-                nodes = cur.fetchone()[0]
-                cur.execute("SELECT COUNT(*) FROM telemetry")
-                telem = cur.fetchone()[0]
-                cur.execute("SELECT COUNT(*) FROM positions")
-                pos = cur.fetchone()[0]
-                cur.execute("SELECT COUNT(*) FROM messages")
-                msgs = cur.fetchone()[0]
-                cur.execute("SELECT MAX(timestamp) FROM telemetry")
-                last_telem = cur.fetchone()[0]
-                cur.execute("SELECT MAX(timestamp) FROM positions")
-                last_pos = cur.fetchone()[0]
-                cur.execute("SELECT MAX(timestamp) FROM messages")
-                last_msg = cur.fetchone()[0]
-                cur.execute("PRAGMA page_count")
-                pc = cur.fetchone()[0]
-                cur.execute("PRAGMA page_size")
-                ps = cur.fetchone()[0]
-                size_mb = (pc * ps) / (1024 * 1024)
-                return {
-                    "nodes": nodes,
-                    "telemetry": telem,
-                    "positions": pos,
-                    "messages": msgs,
-                    "last_telem": last_telem,
-                    "last_pos": last_pos,
-                    "last_msg": last_msg,
-                    "db_size_mb": round(size_mb, 2),
-                }
-        except Exception as e:
-            logger.error(f"Error getting DB health: {e}")
-            return {}
-
-    def get_metric_history(
-        self, node_id: str, metric: str, limit: int = 20
-    ) -> List[Dict[str, Any]]:
-        """Return last N telemetry points for a node/metric."""
-        allowed = {
-            "battery_level",
-            "voltage",
-            "temperature",
-            "humidity",
-            "pressure",
-            "snr",
-            "rssi",
-            "channel_utilization",
-            "air_util_tx",
-        }
-        if metric not in allowed:
-            return []
-        try:
-            with self._get_connection() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    f"""
-                    SELECT {metric}, timestamp
-                    FROM telemetry
-                    WHERE node_id = ?
-                        AND {metric} IS NOT NULL
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                    """,
-                    (node_id, limit),
-                )
-                rows = cur.fetchall()
-                return [
-                    {"value": row[0], "timestamp": row[1]}
-                    for row in rows
-                    if row and row[0] is not None
-                ]
-        except Exception as e:
-            logger.error(f"Error getting metric history for {node_id}/{metric}: {e}")
-            return []
-
-    def get_latest_telemetry_snapshot(self, limit: int = 200) -> List[Dict[str, Any]]:
-        """Return latest telemetry/position values per node (faster joins, no per-field subqueries)."""
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    WITH latest_telem AS (
-                        SELECT t1.*
-                        FROM telemetry t1
-                        JOIN (
-                            SELECT node_id, MAX(timestamp) AS ts
-                            FROM telemetry
-                            GROUP BY node_id
-                        ) tm ON t1.node_id = tm.node_id AND t1.timestamp = tm.ts
-                    ),
-                    latest_pos AS (
-                        SELECT p1.*
-                        FROM positions p1
-                        JOIN (
-                            SELECT node_id, MAX(timestamp) AS ts
-                            FROM positions
-                            GROUP BY node_id
-                        ) pm ON p1.node_id = pm.node_id AND p1.timestamp = pm.ts
-                    )
-                    SELECT
-                        n.node_id,
-                        n.long_name,
-                        n.short_name,
-                        n.last_heard,
-                        lt.battery_level,
-                        lt.voltage,
-                        lt.temperature,
-                        lt.humidity,
-                        lt.pressure,
-                        lt.snr,
-                        lt.rssi,
-                        lt.timestamp AS telemetry_ts,
-                        lp.latitude,
-                        lp.longitude,
-                        lp.altitude,
-                        lp.timestamp AS position_ts
-                    FROM nodes n
-                    LEFT JOIN latest_telem lt ON lt.node_id = n.node_id
-                    LEFT JOIN latest_pos lp ON lp.node_id = n.node_id
-                    ORDER BY datetime(n.last_heard) DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                )
-                cols = [desc[0] for desc in cursor.description]
-                return [dict(zip(cols, row)) for row in cursor.fetchall()]
-        except Exception as e:
-            logger.error(f"Error getting latest telemetry snapshot: {e}")
-            return []
 
     def close_connections(self):
         """Close all connections in the pool"""

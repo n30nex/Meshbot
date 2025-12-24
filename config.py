@@ -8,7 +8,7 @@ BOT_CONFIG = {
     # Message settings
     'message_max_length': 225,
     'command_prefix': '$',
-
+    
     # Node management
     'node_refresh_interval': 60,  # seconds
     # The threshold (in minutes) to consider a node active. Previously this was
@@ -29,12 +29,6 @@ BOT_CONFIG = {
     'presence_threshold_min': 60,            # minutes for ONLINE
     'presence_hysteresis_factor': 2.0,       # offline threshold = threshold * factor
     'boot_announce_suppress_seconds': 30,    # suppress new-node announces right after boot
-    'presence_announcements_enabled': False, # disable presence spam; keep new-node only
-    'connection_watchdog_minutes': 10,       # reconnect if no packets arrive for this many minutes
-    'meshtastic_serial_port': None,          # optional explicit serial port (e.g., COM5 or /dev/ttyUSB0)
-    'geocode_enabled': True,                 # allow reverse geocoding for city lookup
-    'geocode_max_per_run': 20,               # soft cap per command run
-    'geocode_timeout': 3,                    # seconds for HTTP reverse geocode
     
     # Optional alert channel (defaults to main channel if None/0)
     'alert_channel_id': 0,
@@ -73,11 +67,11 @@ NODE_DISPLAY = {
 
 # Message Templates
 MESSAGE_TEMPLATES = {
-    'mesh_message': "\U0001f4e1 **Mesh Message:** {message}",
-    'message_sent': "\u2705 Message sent successfully",
-    'error_generic': "\u26a0\ufe0f An error occurred: {error}",
-    'no_nodes': "\u2139\ufe0f No nodes available",
-    'connection_status': "\U0001f4f6 **Connection Status:**\nDiscord: {discord_status}\nMeshtastic: {mesh_status}",
+    'mesh_message': "📡 **Mesh Message:** {message}",
+    'message_sent': "📤 Message sent successfully",
+    'error_generic': "❌ An error occurred: {error}",
+    'no_nodes': "📡 No nodes available",
+    'connection_status': "🔧 **Connection Status:**\nDiscord: {discord_status}\nMeshtastic: {mesh_status}",
 }
 
 # High altitude detection

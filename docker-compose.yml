@@ -23,7 +23,7 @@ services:
       MESHTASTIC_PORT: /dev/serial/by-id
 
     volumes:
-      - ./data:/data
+      - ./data:/app/data
       - ./logs:/app/logs
 
     command: ["python", "bot.py"]

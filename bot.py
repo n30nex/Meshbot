@@ -4,7 +4,6 @@ import os
 import sys
 import io
 import logging
-from logging.handlers import RotatingFileHandler
 import threading
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
@@ -15,47 +14,19 @@ import meshtastic.tcp_interface
 import meshtastic.serial_interface
 import queue
 import time
-import requests
 from datetime import datetime, timedelta, timezone
 from database import MeshtasticDatabase
 import functools
 import weakref
 from config import BOT_CONFIG, LOGGING_CONFIG
 
-def _configure_logging() -> logging.Logger:
-    """Configure application logging with rotation."""
-    try:
-        level_name = str(LOGGING_CONFIG.get("level", "INFO")).upper()
-        log_level = getattr(logging, level_name, logging.INFO)
-        log_format = LOGGING_CONFIG.get(
-            "format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        log_file = LOGGING_CONFIG.get("file", "bot.log")
-        max_bytes = int(LOGGING_CONFIG.get("max_size", 10 * 1024 * 1024))
-        backup_count = int(LOGGING_CONFIG.get("backup_count", 5))
-    except Exception:
-        log_level = logging.INFO
-        log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        log_file = "bot.log"
-        max_bytes = 10 * 1024 * 1024
-        backup_count = 5
-
-    handlers = [
-        RotatingFileHandler(
-            log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
-        ),
-        logging.StreamHandler(sys.stdout),
-    ]
-
-    logging.basicConfig(
-        level=log_level, format=log_format, handlers=handlers, force=True
-    )
-    logging.captureWarnings(True)
-    return logging.getLogger(__name__)
-
-
 # Configure logging
-logger = _configure_logging()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -119,7 +90,6 @@ class Config:
     discord_token: str
     channel_id: int
     meshtastic_hostname: Optional[str]
-    meshtastic_serial_port: Optional[str] = BOT_CONFIG.get("meshtastic_serial_port")
     message_max_length: int = BOT_CONFIG["message_max_length"]
     node_refresh_interval: int = BOT_CONFIG["node_refresh_interval"]
     active_node_threshold: int = BOT_CONFIG[
@@ -131,12 +101,6 @@ class Config:
     presence_hysteresis_factor: float = BOT_CONFIG.get(
         "presence_hysteresis_factor", 2.0
     )
-    presence_announcements_enabled: bool = BOT_CONFIG.get(
-        "presence_announcements_enabled", True
-    )
-    connection_watchdog_minutes: int = BOT_CONFIG.get(
-        "connection_watchdog_minutes", 10
-    )
 
 
 class MeshtasticInterface:
@@ -146,13 +110,11 @@ class MeshtasticInterface:
         self,
         hostname: Optional[str] = None,
         database: Optional[MeshtasticDatabase] = None,
-        serial_port: Optional[str] = None,
     ):
         self.hostname = hostname
         self.iface = None  # Changed to match reference implementation
         self.database = database
         self.last_node_refresh = 0
-        self.serial_port = serial_port
 
     async def connect(self) -> bool:
         """Connect to Meshtastic radio"""
@@ -161,45 +123,8 @@ class MeshtasticInterface:
                 logger.info(f"Connecting to Meshtastic via TCP: {self.hostname}")
                 self.iface = meshtastic.tcp_interface.TCPInterface(self.hostname)
             else:
-                if self.serial_port:
-                    serial_path = self.serial_port
-                    if os.path.isdir(serial_path):
-                        try:
-                            entries = sorted(
-                                e
-                                for e in os.listdir(serial_path)
-                                if not e.startswith(".")
-                            )
-                            if entries:
-                                serial_path = os.path.join(serial_path, entries[0])
-                                logger.info(
-                                    f"Connecting to Meshtastic via Serial device {serial_path}"
-                                )
-                            else:
-                                logger.warning(
-                                    f"Serial port directory {serial_path} is empty; falling back to default"
-                                )
-                                serial_path = None
-                        except Exception as list_err:
-                            logger.warning(
-                                f"Failed to read serial port directory {serial_path}: {list_err}"
-                            )
-                            serial_path = None
-                    elif not os.path.exists(serial_path):
-                        logger.warning(
-                            f"Serial port {serial_path} not found; falling back to default"
-                        )
-                        serial_path = None
-                    if serial_path:
-                        self.iface = meshtastic.serial_interface.SerialInterface(
-                            devPath=serial_path
-                        )
-                    else:
-                        logger.info("Connecting to Meshtastic via Serial")
-                        self.iface = meshtastic.serial_interface.SerialInterface()
-                else:
-                    logger.info("Connecting to Meshtastic via Serial")
-                    self.iface = meshtastic.serial_interface.SerialInterface()
+                logger.info("Connecting to Meshtastic via Serial")
+                self.iface = meshtastic.serial_interface.SerialInterface()
 
             # Wait for connection
             await asyncio.sleep(2)
@@ -458,13 +383,10 @@ class CommandHandler:
             "$activenodes": self.cmd_active_nodes,
             "$nodes": self.cmd_all_nodes,
             "$telem": self.cmd_telemetry,
-            "$history": self.cmd_history,
-            "$dbhealth": self.cmd_dbhealth,
             "$status": self.cmd_status,
             "$topo": self.cmd_topology_tree,
             "$where": self.cmd_where,
             "$nearest": self.cmd_nearest,
-            "$uptime": self.cmd_uptime,
         }
 
         # Apply command aliases defined in config.  The config.COMMAND_ALIASES
@@ -504,9 +426,6 @@ class CommandHandler:
         self._packet_buffer = []  # Store recent packets for live display
         self._max_packet_buffer = 50  # Keep last 50 packets
         self._packet_buffer_lock = threading.Lock()  # Thread safety for packet buffer
-        self.mesh_to_discord_queue: Optional[queue.Queue] = None
-        self._start_time = time.time()
-        self._geo_cache: Dict[str, str] = {}
 
         # Circuit breaker for database operations
         self._circuit_breaker = {
@@ -854,31 +773,6 @@ class CommandHandler:
         logger.error(f"All retries exhausted for {func.__name__}: {last_exception}")
         return None
 
-    def _enqueue_discord_message(self, payload: str) -> bool:
-        """Enqueue a Discord-originated payload to mesh with drop-oldest policy."""
-        try:
-            self.discord_to_mesh.put_nowait(payload)
-            return True
-        except queue.Full:
-            try:
-                dropped = self.discord_to_mesh.get_nowait()
-                preview = (
-                    f"{dropped[:50]}..."
-                    if isinstance(dropped, str) and len(dropped) > 50
-                    else str(dropped)
-                )
-                logger.warning(
-                    f"Discord→mesh queue full, dropped oldest entry: {preview}"
-                )
-                self.discord_to_mesh.put_nowait(payload)
-                return True
-            except queue.Empty:
-                logger.warning("Discord→mesh queue full and no entries to drop")
-                return False
-        except Exception as e:
-            logger.error(f"Error enqueuing Discord→mesh payload: {e}")
-            return False
-
     def add_packet_to_buffer(self, packet_info: dict):
         """Add packet information to the live monitor buffer (thread-safe)"""
         try:
@@ -1082,57 +976,9 @@ class CommandHandler:
 `$topo` - Visual tree of radio connections
 `$where <name>` - Latest location of a node
 `$nearest <name>` - Nearest nodes to a node
-`$uptime` - Bot uptime and queue health
 `ping` - Mesh connectivity test""",
             inline=False,
         )
-
-        await message.channel.send(embed=embed)
-
-    async def cmd_uptime(self, message: discord.Message):
-        """Show bot uptime and queue health."""
-        uptime_seconds = max(0, time.time() - self._start_time)
-        uptime_text = str(timedelta(seconds=int(uptime_seconds)))
-
-        outbound_size = self.discord_to_mesh.qsize()
-        outbound_capacity = self.discord_to_mesh.maxsize or "∞"
-
-        if self.mesh_to_discord_queue:
-            inbound_size = self.mesh_to_discord_queue.qsize()
-            inbound_capacity = self.mesh_to_discord_queue.maxsize or "∞"
-            inbound_value = f"{inbound_size}/{inbound_capacity}"
-        else:
-            inbound_value = "N/A"
-
-        last_refresh = getattr(self.meshtastic, "last_node_refresh", 0) or 0
-        if last_refresh:
-            refresh_age = max(0, time.time() - last_refresh)
-            refresh_text = f"{int(refresh_age)}s ago"
-        else:
-            refresh_text = "Not yet"
-
-        try:
-            iface_ok = (
-                self.meshtastic.iface.isConnected()
-                if self.meshtastic.iface and hasattr(self.meshtastic.iface, "isConnected")
-                else False
-            )
-            iface_status = "Connected" if iface_ok else "Disconnected"
-        except Exception:
-            iface_status = "Unknown"
-
-        embed = discord.Embed(
-            title="\u23f1\ufe0f Bridge Uptime & Queues",
-            color=0x00BFFF,
-            timestamp=get_utc_time(),
-        )
-        embed.add_field(name="Uptime", value=uptime_text, inline=True)
-        embed.add_field(
-            name="Discord \u2192 Mesh", value=f"{outbound_size}/{outbound_capacity}", inline=True
-        )
-        embed.add_field(name="Mesh \u2192 Discord", value=inbound_value, inline=True)
-        embed.add_field(name="Last Node Refresh", value=refresh_text, inline=True)
-        embed.add_field(name="Interface", value=iface_status, inline=True)
 
         await message.channel.send(embed=embed)
 
@@ -1160,11 +1006,10 @@ class CommandHandler:
         await self._safe_send(
             message.channel, f"📤 Sending to primary channel:\n```{message_text}```"
         )
-        if not self._enqueue_discord_message(message_text):
-            await self._safe_send(
-                message.channel,
-                "⚠️ Message queue is full, please try again in a moment.",
-            )
+        try:
+            self.discord_to_mesh.put_nowait(message_text)
+        except queue.Full:
+            logger.warning("Discord to mesh queue is full, dropping message")
             return False
 
     async def cmd_send_node(self, message: discord.Message):
@@ -1249,11 +1094,14 @@ class CommandHandler:
                 message.channel,
                 f"📤 Sending to node **{node['long_name']}** (ID: {final_node_id}):\n```{message_text}```",
             )
-            if not self._enqueue_discord_message(
-                f"nodenum={final_node_id} {message_text}"
-            ):
+            try:
+                self.discord_to_mesh.put_nowait(
+                    f"nodenum={final_node_id} {message_text}"
+                )
+            except queue.Full:
+                logger.warning("Discord to mesh queue is full, dropping message")
                 await self._safe_send(
-                    message.channel, "⚠️ Message queue is full, please try again later."
+                    message.channel, "❌ Message queue is full, please try again later."
                 )
                 return
             logger.info(f"Sent message with node ID: {final_node_id}")
@@ -1296,38 +1144,26 @@ class CommandHandler:
             )
             return
 
-        await self._attach_locations(nodes)
-
-        threshold = BOT_CONFIG["active_node_threshold"]
-        summary_lines = [
-            f"Active nodes: {len(nodes)} (last {threshold} minutes)",
-        ]
-        try:
-            embed_color = BOT_CONFIG.get("embed_color", 0x00FF00)
-        except Exception:
-            embed_color = 0x00FF00
-
-        try:
-            page_size = BOT_CONFIG.get("node_page_size", 40) if isinstance(BOT_CONFIG, dict) else 40
-            total_pages = max(1, (len(nodes) + page_size - 1) // page_size)
-            for page in range(total_pages):
-                slice_nodes = nodes[page * page_size : (page + 1) * page_size]
-                title = f"Active Nodes (last {threshold} min)"
-                if total_pages > 1:
-                    title = f"{title} ({page+1}/{total_pages})"
-                embeds = self._build_nodes_embeds(
-                    title=title,
-                    nodes=slice_nodes,
-                    summary_lines=summary_lines if page == 0 else [],
-                    color=embed_color,
+        active_nodes = []
+        for node in nodes:
+            try:
+                node_info = self._format_node_info(node)
+                active_nodes.append(node_info)
+            except Exception as e:
+                logger.error(
+                    f"Error processing node {node.get('node_id', 'Unknown')}: {e}"
                 )
-                for embed in embeds:
-                    await message.channel.send(embed=embed)
+                continue
+
+        response = (
+            f"📡 **Active Nodes (Last {BOT_CONFIG['active_node_threshold']} minutes):**\n"
+            + "\n".join(active_nodes)
+        )
+        try:
+            await self._send_long_message(message.channel, response)
         except Exception as send_error:
-            logger.error(f"Error sending active nodes embed: {send_error}")
-            await self._safe_send(
-                message.channel, "❌ Error sending message to channel."
-            )
+            logger.error(f"Error sending message to channel: {send_error}")
+            await message.channel.send("❌ Error sending message to channel.")
 
     async def cmd_all_nodes(self, message: discord.Message):
         """Show all known nodes"""
@@ -1344,63 +1180,22 @@ class CommandHandler:
             await message.channel.send("❌ Error retrieving node data from database.")
             return
 
-        await self._attach_locations(nodes)
-
-        try:
-            threshold = BOT_CONFIG["active_node_threshold"]
-        except Exception:
-            threshold = 60
-        try:
-            now = datetime.utcnow()
-            active_cutoff = now - timedelta(minutes=threshold)
-            active_count = 0
-            for node in nodes:
-                last_heard = node.get("last_heard")
-                if not last_heard:
-                    continue
-                try:
-                    if "T" in last_heard:
-                        dt = datetime.fromisoformat(last_heard.replace("Z", "+00:00"))
-                        if dt.tzinfo is not None:
-                            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-                    else:
-                        dt = datetime.strptime(last_heard, "%Y-%m-%d %H:%M:%S")
-                    if dt > active_cutoff:
-                        active_count += 1
-                except Exception:
-                    continue
-        except Exception:
-            active_count = 0
-
-        routers = sum(1 for node in nodes if node.get("is_router"))
-        summary_lines = [
-            f"Total nodes: {len(nodes)}",
-            f"Active (last {threshold} min): {active_count}",
-            f"Routers: {routers}",
-        ]
-        try:
-            embed_color = BOT_CONFIG.get("embed_color", 0x00FF00)
-        except Exception:
-            embed_color = 0x00FF00
-
-        try:
-            page_size = BOT_CONFIG.get("node_page_size", 40) if isinstance(BOT_CONFIG, dict) else 40
-            total_pages = max(1, (len(nodes) + page_size - 1) // page_size)
-            for page in range(total_pages):
-                slice_nodes = nodes[page * page_size : (page + 1) * page_size]
-                title = "All Known Nodes"
-                if total_pages > 1:
-                    title = f"{title} ({page+1}/{total_pages})"
-                embeds = self._build_nodes_embeds(
-                    title=title,
-                    nodes=slice_nodes,
-                    summary_lines=summary_lines if page == 0 else [],
-                    color=embed_color,
+        node_list = []
+        for node in nodes:
+            try:
+                node_info = self._format_node_info(node)
+                node_list.append(node_info)
+            except Exception as e:
+                logger.error(
+                    f"Error processing node {node.get('node_id', 'Unknown')}: {e}"
                 )
-                for embed in embeds:
-                    await message.channel.send(embed=embed)
+                continue
+
+        response = "📡 **All Known Nodes:**\n" + "\n".join(node_list)
+        try:
+            await self._send_long_message(message.channel, response)
         except Exception as send_error:
-            logger.error(f"Error sending all nodes embed: {send_error}")
+            logger.error(f"Error sending message to channel: {send_error}")
             await self._safe_send(
                 message.channel, "❌ Error sending message to channel."
             )
@@ -1431,6 +1226,18 @@ class CommandHandler:
             )
             return
 
+        # Check connection status safely
+        connection_status = "❌ Disconnected"
+        if self.meshtastic.iface:
+            try:
+                if hasattr(self.meshtastic.iface, "isConnected") and callable(
+                    self.meshtastic.iface.isConnected
+                ):
+                    if self.meshtastic.iface.isConnected():
+                        connection_status = "✅ Connected"
+            except Exception:
+                connection_status = "❌ Disconnected"
+
         embed = discord.Embed(
             title="📊 Telemetry Summary",
             description="Last 60 minutes of network telemetry data",
@@ -1442,7 +1249,8 @@ class CommandHandler:
         embed.add_field(
             name="📡 **Network Status**",
             value=f"""Total Nodes: {summary.get("total_nodes", 0)}
-Active Nodes: {summary.get("active_nodes", 0)}""",
+Active Nodes: {summary.get("active_nodes", 0)}
+Connection: {connection_status}""",
             inline=True,
         )
 
@@ -1480,236 +1288,6 @@ Active Nodes: {summary.get("active_nodes", 0)}""",
         embed.add_field(name="📶 **Signal Quality**", value=signal_data, inline=True)
 
         await message.channel.send(embed=embed)
-
-        # Latest per-node telemetry snapshot (paged later)
-        try:
-            nodes = await self._run_db_query(
-                self.database.get_latest_telemetry_snapshot, limit=200, timeout=10
-            )
-        except Exception as node_err:
-            logger.error(f"Error loading nodes for telemetry details: {node_err}")
-            nodes = []
-
-        def _fmt_pct(val):
-            if val is None:
-                return None
-            try:
-                return f"{int(val)}%"
-            except Exception:
-                return None
-
-        def _fmt_num(val, decimals=1, suffix=""):
-            if val is None:
-                return None
-            try:
-                return f"{float(val):.{decimals}f}{suffix}"
-            except Exception:
-                return None
-
-        def _fmt_uptime(seconds):
-            if not seconds:
-                return "--"
-            try:
-                seconds = float(seconds)
-            except Exception:
-                return "--"
-            if seconds <= 0:
-                return "0s"
-            minutes = seconds / 60
-            hours = minutes / 60
-            days = hours / 24
-            if days >= 1:
-                return f"{days:.1f}d"
-            if hours >= 1:
-                return f"{hours:.1f}h"
-            return f"{minutes:.0f}m"
-
-        def _fmt_seen(last_heard):
-            age = self._format_age_short(last_heard)
-            return age if age else "--"
-
-        rows = []
-        for node in nodes or []:
-            battery = node.get("battery_level")
-            voltage = node.get("voltage")
-            chan_util = node.get("channel_utilization")
-            air_util = node.get("air_util_tx")
-            uptime = node.get("uptime_seconds")
-            temp = node.get("temperature")
-            humid = node.get("humidity")
-            pressure = node.get("pressure")
-            snr = node.get("snr")
-            rssi = node.get("rssi")
-
-            if all(
-                v is None
-                for v in [
-                    battery,
-                    voltage,
-                    chan_util,
-                    air_util,
-                    uptime,
-                    temp,
-                    humid,
-                    pressure,
-                    snr,
-                    rssi,
-                ]
-            ):
-                continue
-
-            name = (
-                node.get("long_name")
-                or node.get("short_name")
-                or node.get("node_id")
-                or "Unknown"
-            )
-            name = self._truncate_text(str(name), 18)
-            node_id = str(node.get("node_id") or "")
-            node_id_short = node_id[-4:] if len(node_id) >= 4 else node_id or "--"
-            age = _fmt_seen(node.get("last_heard"))
-
-            bat_txt = _fmt_pct(battery) or "--"
-            volt_txt = _fmt_num(voltage, decimals=3, suffix="") or "--"
-            temp_txt = _fmt_num(temp, decimals=1, suffix="") or "--"
-            humid_txt = _fmt_num(humid, decimals=0, suffix="") or "--"
-            press_txt = _fmt_num(pressure, decimals=0, suffix="") or "--"
-            chan_txt = _fmt_num(chan_util, decimals=1, suffix="") or "--"
-            air_txt = _fmt_num(air_util, decimals=1, suffix="") or "--"
-            up_txt = _fmt_uptime(uptime)
-            seen_txt = age or "--"
-            pos_ts = node.get("position_ts") or node.get("last_heard")
-
-            rows.append(
-                {
-                    "id": node_id_short,
-                    "name": name,
-                    "bat": bat_txt,
-                    "volt": volt_txt,
-                    "temp": temp_txt,
-                    "humid": humid_txt,
-                    "press": press_txt,
-                    "chan": chan_txt,
-                    "air": air_txt,
-                    "uptime": up_txt,
-                    "seen": seen_txt,
-                    "pos_ts": pos_ts,
-                }
-            )
-
-        if rows:
-            per_page = 40
-            total_pages = max(1, (len(rows) + per_page - 1) // per_page)
-            for page in range(total_pages):
-                slice_rows = rows[page * per_page : (page + 1) * per_page]
-                header = (
-                    f"{'ID':<6} | {'Name':<20} | {'Bat%':>5} | {'Volt':>6} | "
-                    f"{'Temp°C':>6} | {'Hum%':>5} | {'hPa':>6} | "
-                    f"{'Ch%':>5} | {'Air%':>5} | {'Uptime':>8} | {'Seen':>6}"
-                )
-                divider = "-" * len(header)
-                table_lines = [header, divider]
-                for r in slice_rows:
-                    line = (
-                        f"{r['id']:<6} | "
-                        f"{r['name']:<20} | "
-                        f"{r['bat']:>5} | "
-                        f"{r['volt']:>6} | "
-                        f"{r['temp']:>6} | "
-                        f"{r['humid']:>5} | "
-                        f"{r['press']:>6} | "
-                        f"{r['chan']:>5} | "
-                        f"{r['air']:>5} | "
-                        f"{r['uptime']:>8} | "
-                        f"{r['seen']:>6}"
-                    )
-                    table_lines.append(line)
-
-                block = "```text\n" + "\n".join(table_lines) + "\n```"
-                await message.channel.send(block)
-
-    async def cmd_history(self, message: discord.Message):
-        """Show recent metric history: $history <node> <metric>"""
-        try:
-            parts = message.content.strip().split()
-            if len(parts) < 3:
-                await self._safe_send(
-                    message.channel,
-                    "Use: `$history <node> <metric>` (metric: battery_level, voltage, temperature, humidity, pressure, snr, rssi, channel_utilization, air_util_tx)",
-                )
-                return
-            name = parts[1]
-            metric = parts[2]
-            node = await self._run_db_query(
-                self.database.find_node_by_name, name, timeout=5
-            )
-            if not node:
-                await self._safe_send(
-                    message.channel, f"No node found matching '{name}'."
-                )
-                return
-            hist = await self._run_db_query(
-                self.database.get_metric_history,
-                node.get("node_id"),
-                metric,
-                20,
-                timeout=5,
-            )
-            if not hist:
-                await self._safe_send(
-                    message.channel, f"No data for {metric} on {node.get('long_name')}"
-                )
-                return
-            lines = [f"{node.get('long_name')} [{metric}] last {len(hist)}:"]
-            for entry in hist:
-                val = entry.get("value")
-                ts = entry.get("timestamp")
-                lines.append(f"- {ts}: {val}")
-            await self._safe_send(message.channel, "\n".join(lines))
-        except Exception as e:
-            logger.error(f"Error in history command: {e}")
-            await self._safe_send(message.channel, "Error fetching history.")
-
-    async def cmd_dbhealth(self, message: discord.Message):
-        """Show database health and last timestamps"""
-        try:
-            stats = await self._run_db_query(self.database.get_db_health, timeout=5)
-            if not stats:
-                await self._safe_send(message.channel, "DB stats unavailable.")
-                return
-            embed = discord.Embed(
-                title="🗄️ DB Health",
-                color=0x3498DB,
-                timestamp=get_utc_time(),
-            )
-            embed.add_field(
-                name="Counts",
-                value=(
-                    f"Nodes: {stats.get('nodes',0)}\n"
-                    f"Telemetry: {stats.get('telemetry',0)}\n"
-                    f"Positions: {stats.get('positions',0)}\n"
-                    f"Messages: {stats.get('messages',0)}\n"
-                ),
-                inline=True,
-            )
-            embed.add_field(
-                name="Last seen",
-                value=(
-                    f"Telemetry: {stats.get('last_telem') or 'n/a'}\n"
-                    f"Position: {stats.get('last_pos') or 'n/a'}\n"
-                    f"Message: {stats.get('last_msg') or 'n/a'}\n"
-                ),
-                inline=True,
-            )
-            embed.add_field(
-                name="Size",
-                value=f"{stats.get('db_size_mb','?')} MB",
-                inline=True,
-            )
-            await message.channel.send(embed=embed)
-        except Exception as e:
-            logger.error(f"Error in dbhealth command: {e}")
-            await self._safe_send(message.channel, "Error fetching DB health.")
 
     async def cmd_status(self, message: discord.Message):
         """Show bridge status"""
@@ -1929,44 +1507,21 @@ Avg Hops: {topology["avg_hops"]:.1f}""",
             await status_msg.delete()
 
             # Create readable connection tree
-            connection_tree = self._build_topology_ascii(
-                nodes, topology.get("connections", [])
+            connection_tree = self._create_connection_tree(
+                nodes, topology["connections"]
             )
 
             # Add summary info
             total_nodes = len(nodes)
-            active_connections = len(topology.get("connections", []))
-            avg_hops = topology.get("avg_hops", 0) or 0
-            try:
-                embed_color = BOT_CONFIG.get("embed_color", 0x00FF00)
-            except Exception:
-                embed_color = 0x00FF00
+            active_connections = len(topology["connections"])
+            avg_hops = topology.get("avg_hops", 0)
 
-            lines = connection_tree.splitlines()
-            chunks = self._chunk_lines(lines, 3400)
-            for idx, chunk in enumerate(chunks, start=1):
-                block = "```text\n" + "\n".join(chunk) + "\n```"
-                title = "Network Topology"
-                if len(chunks) > 1:
-                    title = f"Network Topology ({idx}/{len(chunks)})"
-                embed = discord.Embed(
-                    title=title,
-                    description=block,
-                    color=embed_color,
-                    timestamp=get_utc_time(),
-                )
-                if idx == 1:
-                    embed.add_field(
-                        name="Summary",
-                        value=(
-                            f"Radios: {total_nodes}\n"
-                            f"Connections: {active_connections}\n"
-                            f"Avg hops: {avg_hops:.1f}"
-                        ),
-                        inline=False,
-                    )
-                embed.set_footer(text="Connections are based on last 24 hours")
-                await message.channel.send(embed=embed)
+            # Send the formatted tree
+            await self._send_long_message(message.channel, connection_tree)
+
+            # Send summary
+            summary = f"\n📊 **Network Summary:** {total_nodes} radios | {active_connections} routes | {avg_hops:.1f} avg hops"
+            await message.channel.send(summary)
 
         except Exception as e:
             logger.error(f"Error creating topology tree: {e}")
@@ -3158,370 +2713,6 @@ Last Heard: {nodes[0].get("last_heard", "Unknown")}""",
         except Exception as e:
             logger.error(f"Error formatting node info: {e}")
             return f"**Node {node.get('node_id', 'Unknown')}** - Error formatting data"
-
-    def _truncate_text(self, text: str, width: int) -> str:
-        """Truncate text to a fixed width using ASCII ellipsis."""
-        if width <= 0:
-            return ""
-        if text is None:
-            text = ""
-        text = str(text)
-        if len(text) <= width:
-            return text
-        if width <= 3:
-            return text[:width]
-        return text[: width - 3] + "..."
-
-    def _format_age_short(self, last_heard: Optional[str]) -> str:
-        """Return age as short text like 5m, 2h, 1d."""
-        if not last_heard:
-            return "--"
-        dt = None
-        try:
-            if isinstance(last_heard, str):
-                if "T" in last_heard:
-                    dt = datetime.fromisoformat(last_heard.replace("Z", "+00:00"))
-                else:
-                    dt = datetime.strptime(last_heard, "%Y-%m-%d %H:%M:%S")
-            elif isinstance(last_heard, datetime):
-                dt = last_heard
-        except Exception:
-            dt = None
-        if not dt:
-            return "--"
-        now = datetime.utcnow()
-        if dt.tzinfo is not None:
-            now = datetime.now(tz=dt.tzinfo)
-        delta = now - dt
-        minutes = int(delta.total_seconds() // 60)
-        if minutes < 0:
-            minutes = 0
-        if minutes < 60:
-            return f"{minutes}m"
-        hours = minutes // 60
-        if hours < 24:
-            return f"{hours}h"
-        days = hours // 24
-        return f"{days}d"
-
-    def _format_node_row(self, node: Dict[str, Any]) -> str:
-        """Format a node row for compact, human-readable tables."""
-        name = (
-            node.get("long_name")
-            or node.get("short_name")
-            or node.get("node_id")
-            or "Unknown"
-        )
-        name = self._truncate_text(str(name), 18)
-        node_id = str(node.get("node_id") or "")
-        node_id_short = node_id[-4:] if len(node_id) >= 4 else node_id or "--"
-        hops = node.get("hops_away")
-        snr = node.get("snr")
-        batt = node.get("battery_level")
-        last = self._format_age_short(node.get("last_heard"))
-
-        hops_txt = f"{int(hops):>2}" if hops is not None else " -"
-        if snr is None:
-            snr_txt = "  --"
-        else:
-            try:
-                snr_txt = f"{float(snr):>4.1f}"
-            except Exception:
-                snr_txt = "  --"
-        if batt is None:
-            batt_txt = "  --"
-        else:
-            try:
-                batt_txt = f"{int(batt):>3}%"
-            except Exception:
-                batt_txt = "  --"
-
-        city = node.get("approx_location") or ""
-        city_txt = f" | {city}" if city else ""
-
-        return f"{name:<18} {node_id_short:>4} {hops_txt:>2} {snr_txt:>5} {batt_txt:>4} {last:>4}{city_txt}"
-
-    def _chunk_lines(self, lines: List[str], max_chars: int) -> List[List[str]]:
-        """Chunk lines to fit within Discord embed description limits."""
-        chunks = []
-        current = []
-        current_len = 0
-        for line in lines:
-            line_len = len(line) + 1
-            if current and current_len + line_len > max_chars:
-                chunks.append(current)
-                current = []
-                current_len = 0
-            current.append(line)
-            current_len += line_len
-        if current:
-            chunks.append(current)
-        return chunks
-
-    async def _reverse_geocode(self, lat: float, lon: float) -> Optional[str]:
-        """Lookup nearest locality using Nominatim (cached, best-effort)."""
-        try:
-            from config import BOT_CONFIG
-            if not BOT_CONFIG.get("geocode_enabled", True):
-                return None
-            timeout = BOT_CONFIG.get("geocode_timeout", 3)
-        except Exception:
-            timeout = 3
-        try:
-            lat = float(lat)
-            lon = float(lon)
-        except Exception:
-            return None
-
-        key = f"{round(lat, 2)},{round(lon, 2)}"
-        if key in self._geo_cache:
-            return self._geo_cache[key]
-
-        def _call():
-            try:
-                resp = requests.get(
-                    "https://nominatim.openstreetmap.org/reverse",
-                    params={"format": "json", "lat": lat, "lon": lon, "zoom": 10},
-                    headers={"User-Agent": "meshtastic-discord-bot/1.0"},
-                    timeout=timeout,
-                )
-                if resp.status_code != 200:
-                    return None
-                data = resp.json()
-                addr = data.get("address", {})
-                for field in ["city", "town", "village", "hamlet", "county"]:
-                    if addr.get(field):
-                        return addr[field]
-                if data.get("display_name"):
-                    return data["display_name"].split(",")[0]
-            except Exception:
-                return None
-            return None
-
-        city = await asyncio.to_thread(_call)
-        if city:
-            self._geo_cache[key] = city
-        return city
-
-    async def _attach_locations(self, nodes: List[Dict[str, Any]]):
-        """Add approx_location to nodes when lat/lon available."""
-        try:
-            from config import BOT_CONFIG
-            max_lookups = BOT_CONFIG.get("geocode_max_per_run", 20)
-        except Exception:
-            max_lookups = 20
-
-        tasks = []
-        for node in nodes or []:
-            if node.get("approx_location"):
-                continue
-            lat = node.get("latitude")
-            lon = node.get("longitude")
-            if lat is None or lon is None:
-                continue
-            if len(tasks) >= max_lookups:
-                break
-
-            async def _set_loc(n: Dict[str, Any], la, lo):
-                city = await self._reverse_geocode(la, lo)
-                if city:
-                    n["approx_location"] = city
-
-            tasks.append(_set_loc(node, lat, lon))
-
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-    def _build_nodes_embeds(
-        self,
-        title: str,
-        nodes: List[Dict[str, Any]],
-        summary_lines: List[str],
-        color: int,
-    ) -> List[discord.Embed]:
-        """Create embeds for node listings with compact tables."""
-        header = "Name               ID  Hp   SNR  Bat Last"
-        divider = "-" * len(header)
-        rows = [self._format_node_row(node) for node in nodes]
-        lines = [header, divider] + rows
-        chunks = self._chunk_lines(lines, 3400)
-
-        embeds = []
-        for idx, chunk in enumerate(chunks, start=1):
-            block = "```text\n" + "\n".join(chunk) + "\n```"
-            page_title = title if len(chunks) == 1 else f"{title} ({idx}/{len(chunks)})"
-            embed = discord.Embed(
-                title=page_title,
-                description=block,
-                color=color,
-                timestamp=get_utc_time(),
-            )
-            if idx == 1 and summary_lines:
-                embed.add_field(
-                    name="Summary",
-                    value="\n".join(summary_lines)[:1024],
-                    inline=False,
-                )
-            embed.set_footer(text="UTC time | ID column shows last 4 chars")
-            embeds.append(embed)
-        return embeds
-
-    def _build_topology_ascii(
-        self, nodes: List[Dict[str, Any]], connections: List[Dict[str, Any]]
-    ) -> str:
-        """Build a multiline ASCII topology view using hops and all known connections."""
-        if not nodes:
-            return "No nodes available."
-
-        name_by_id: Dict[str, str] = {}
-        hops_by_id: Dict[str, Optional[int]] = {}
-        for node in nodes:
-            node_id = str(node.get("node_id") or "")
-            name = (
-                node.get("long_name")
-                or node.get("short_name")
-                or node_id
-                or "Unknown"
-            )
-            name_by_id[node_id] = self._truncate_text(str(name), 20)
-            hop_val = node.get("hops_away")
-            try:
-                hops_by_id[node_id] = int(hop_val) if hop_val is not None else None
-            except Exception:
-                hops_by_id[node_id] = None
-
-        adjacency: Dict[str, List[Dict[str, Any]]] = {}
-        for conn in connections or []:
-            from_id = str(conn.get("from_node") or "")
-            to_id = str(conn.get("to_node") or "")
-            if not from_id or not to_id:
-                continue
-            msg_count = conn.get("message_count", 0) or 0
-            avg_hops = conn.get("avg_hops", 0) or 0
-            entry = {"node": to_id, "message_count": msg_count, "avg_hops": avg_hops}
-            adjacency.setdefault(from_id, []).append(entry)
-            entry_rev = {"node": from_id, "message_count": msg_count, "avg_hops": avg_hops}
-            adjacency.setdefault(to_id, []).append(entry_rev)
-
-        if not adjacency:
-            return "No recent connections found."
-
-        def _degree_score(node_id: str) -> int:
-            return sum(n.get("message_count", 0) or 0 for n in adjacency.get(node_id, []))
-
-        # Roots: prefer hop 0; fallback to top-degree nodes
-        roots = [nid for nid, hop in hops_by_id.items() if hop == 0]
-        if not roots:
-            roots = sorted(adjacency.keys(), key=_degree_score, reverse=True)[:5]
-
-        # Build probable parent mapping based on hops and message volume
-        parent_for: Dict[str, str] = {}
-        nodes_sorted = sorted(
-            hops_by_id.keys(),
-            key=lambda nid: (
-                hops_by_id.get(nid) if hops_by_id.get(nid) is not None else 999,
-                -_degree_score(nid),
-            ),
-        )
-        for nid in nodes_sorted:
-            if nid in roots:
-                continue
-            best_parent = None
-            best_score = None
-            for edge in adjacency.get(nid, []):
-                neighbor = edge["node"]
-                neighbor_hop = hops_by_id.get(neighbor)
-                node_hop = hops_by_id.get(nid)
-                msg = edge.get("message_count", 0) or 0
-                avg_h = edge.get("avg_hops", 0) or 0
-                # Prefer parents that are closer to root (lower hop), then higher traffic, then lower avg hops
-                hop_rank = 0
-                if neighbor_hop is None or node_hop is None:
-                    hop_rank = 1
-                elif neighbor_hop > node_hop:
-                    hop_rank = 2
-                score = (
-                    hop_rank,
-                    neighbor_hop if neighbor_hop is not None else 99,
-                    -msg,
-                    avg_h,
-                )
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_parent = neighbor
-            if best_parent:
-                parent_for[nid] = best_parent
-
-        children: Dict[str, List[str]] = {}
-        for child, parent in parent_for.items():
-            children.setdefault(parent, []).append(child)
-
-        def _format_node_line(node_id: str, prefix: str, is_last: bool) -> List[str]:
-            connector = "└─" if is_last else "├─"
-            name = name_by_id.get(node_id, node_id) or node_id
-            short_id = node_id[-4:] if len(node_id) >= 4 else node_id or "--"
-            hops = hops_by_id.get(node_id)
-            hop_txt = f"{hops}h" if hops is not None else "?h"
-            parent_id = parent_for.get(node_id)
-            via_txt = ""
-            if parent_id:
-                via_name = name_by_id.get(parent_id, parent_id) or parent_id
-                via_txt = f" via {via_name}"
-            line = f"{prefix}{connector} {name} [{short_id}] ({hop_txt}{via_txt})"
-            return [line]
-
-        lines = ["MESH CONNECTIONS (last 24h)", "=" * 32]
-
-        def _walk(node_id: str, prefix: str = ""):
-            child_list = sorted(
-                children.get(node_id, []),
-                key=lambda nid: (
-                    hops_by_id.get(nid) if hops_by_id.get(nid) is not None else 999,
-                    -_degree_score(nid),
-                ),
-            )
-            for idx, child in enumerate(child_list):
-                last_child = idx == len(child_list) - 1
-                lines.extend(_format_node_line(child, prefix, last_child))
-                new_prefix = prefix + ("   " if last_child else "│  ")
-                _walk(child, new_prefix)
-
-        # Emit roots and their trees
-        roots_sorted = sorted(
-            roots,
-            key=lambda nid: (-_degree_score(nid), hops_by_id.get(nid) or 0, nid),
-        )
-        for r_idx, root in enumerate(roots_sorted):
-            if r_idx > 0:
-                lines.append("")
-            root_name = name_by_id.get(root, root) or root
-            short_id = root[-4:] if len(root) >= 4 else root or "--"
-            hop_txt = f"{hops_by_id.get(root)}h" if hops_by_id.get(root) is not None else "?h"
-            lines.append(f"{root_name} [{short_id}] ({hop_txt})")
-            _walk(root, prefix="")
-
-        # Add a complete connection list to surface every known edge
-        lines.append("")
-        lines.append("Connections (all, last 24h):")
-        all_edges = sorted(
-            connections or [],
-            key=lambda c: c.get("message_count", 0) or 0,
-            reverse=True,
-        )
-        for edge in all_edges:
-            f_id = str(edge.get("from_node") or "")
-            t_id = str(edge.get("to_node") or "")
-            if not f_id or not t_id:
-                continue
-            f_name = name_by_id.get(f_id, f_id) or f_id
-            t_name = name_by_id.get(t_id, t_id) or t_id
-            msgs = edge.get("message_count", 0) or 0
-            avg_h = edge.get("avg_hops", 0) or 0
-            lines.append(
-                f"- {f_name} [{f_id[-4:] or '--'}] -> {t_name} [{t_id[-4:] or '--'}] ({msgs} msgs, {avg_h:.1f} hops)"
-            )
-
-        return "\n".join(lines).rstrip()
 
     def _create_connection_tree(self, nodes, connections):
         """Create readable ASCII tree for Discord showing network topology"""
@@ -4734,15 +3925,6 @@ class DiscordBot(discord.Client):
         self.command_handler = CommandHandler(
             meshtastic, self.discord_to_mesh, database
         )
-        self._last_mesh_rx_time = time.time()
-        try:
-            self._watchdog_threshold = max(
-                0,
-                int(getattr(config, "connection_watchdog_minutes", 10)) * 60,
-            )
-        except Exception:
-            self._watchdog_threshold = 600
-        self.command_handler.mesh_to_discord_queue = self.mesh_to_discord
 
         # Background task
         self.bg_task = None
@@ -4934,26 +4116,6 @@ class DiscordBot(discord.Client):
                     sent_counts = {"announcement": 0, "alert": 0, "command_reply": 0}
                     rate_window_start = now
 
-                # Watchdog: reconnect if no mesh packets have been seen recently
-                if (
-                    self._watchdog_threshold
-                    and (now - self._last_mesh_rx_time) > self._watchdog_threshold
-                ):
-                    logger.warning(
-                        "No mesh packets received within watchdog window; attempting reconnect"
-                    )
-                    try:
-                        # Close existing iface if possible
-                        if self.meshtastic.iface:
-                            try:
-                                self.meshtastic.iface.close()
-                            except Exception:
-                                pass
-                        await self.meshtastic.connect()
-                        self._last_mesh_rx_time = time.time()
-                    except Exception as watchdog_err:
-                        logger.error(f"Watchdog reconnect failed: {watchdog_err}")
-
                 await asyncio.sleep(1)  # Check every second
 
             except Exception as e:
@@ -4986,13 +4148,7 @@ class DiscordBot(discord.Client):
                 threshold_min = 60
                 hysteresis = 2.0
             # Fetch nodes
-            nodes = (
-                await asyncio.to_thread(
-                    self.database.get_presence_snapshot, 1000
-                )
-                if self.database
-                else []
-            )
+            nodes = self.database.get_all_nodes(limit=1000) if self.database else []
             now_utc = datetime.utcnow()
             online_cutoff = now_utc - timedelta(minutes=threshold_min)
             offline_cutoff = now_utc - timedelta(
@@ -5000,8 +4156,6 @@ class DiscordBot(discord.Client):
             )
             for n in nodes:
                 node_id = n.get("node_id")
-                if not node_id:
-                    continue
                 last_heard = n.get("last_heard")
                 prev_state = (n.get("presence_state") or "").lower()
                 # Compute new state
@@ -5027,31 +4181,25 @@ class DiscordBot(discord.Client):
                 if new_state != prev_state:
                     # Update DB state
                     try:
-                        await asyncio.to_thread(
-                            self.database.update_presence_state, node_id, new_state
-                        )
+                        with self.database._get_connection() as conn:
+                            cur = conn.cursor()
+                            cur.execute(
+                                "UPDATE nodes SET presence_state = ? WHERE node_id = ?",
+                                (new_state, node_id),
+                            )
+                            conn.commit()
                     except Exception as upd_err:
                         logger.debug(
                             f"Presence state update failed for {node_id}: {upd_err}"
                         )
                     # Announce transitions (dedupe via alerts table)
-                    if not getattr(
-                        self.config, "presence_announcements_enabled", True
-                    ):
-                        continue
                     try:
                         alert_type = f"presence_{new_state}"
-                        recent = (
-                            await asyncio.to_thread(
-                                self.database.recent_alert_exists,
-                                node_id,
-                                alert_type,
-                                threshold_min,
-                            )
-                            if hasattr(self.database, "recent_alert_exists")
-                            else True
-                        )
-                        if not recent:
+                        if hasattr(
+                            self.database, "recent_alert_exists"
+                        ) and not self.database.recent_alert_exists(
+                            node_id, alert_type, minutes=threshold_min
+                        ):
                             name = n.get("long_name") or node_id
                             emoji = (
                                 "🟢"
@@ -5067,9 +4215,7 @@ class DiscordBot(discord.Client):
                             if ch:
                                 await ch.send(msg)
                             if hasattr(self.database, "record_alert"):
-                                await asyncio.to_thread(
-                                    self.database.record_alert, node_id, alert_type
-                                )
+                                self.database.record_alert(node_id, alert_type)
                     except Exception as ann_err:
                         logger.debug(
                             f"Presence announce failed for {node_id}: {ann_err}"
@@ -5499,9 +4645,6 @@ class DiscordBot(discord.Client):
                 logger.debug("Received packet without decoded data")
                 return
 
-            # Update watchdog timestamp
-            self._last_mesh_rx_time = time.time()
-
             portnum = packet["decoded"]["portnum"]
             from_id = packet.get("fromId", "Unknown")
             to_id = packet.get("toId", "Primary")
@@ -5786,22 +4929,6 @@ class DiscordBot(discord.Client):
             if packet.get("frequency") is not None:
                 extracted_data["frequency"] = packet["frequency"]
 
-            # Position data that can be embedded in telemetry
-            pos_obj = telemetry_data.get("position") or {}
-            lat = pos_obj.get("latitude") or pos_obj.get("latitude_i")
-            lon = pos_obj.get("longitude") or pos_obj.get("longitude_i")
-            alt = pos_obj.get("altitude")
-            if lat is not None and lon is not None:
-                try:
-                    lat_f = float(lat) / (1e7 if "latitude_i" in pos_obj else 1.0)
-                    lon_f = float(lon) / (1e7 if "longitude_i" in pos_obj else 1.0)
-                    extracted_data["latitude"] = lat_f
-                    extracted_data["longitude"] = lon_f
-                    if alt is not None:
-                        extracted_data["altitude"] = float(alt)
-                except Exception:
-                    pass
-
             # Store telemetry data if we have any
             if extracted_data:
                 try:
@@ -6003,50 +5130,20 @@ class DiscordBot(discord.Client):
         try:
             from_id = packet.get("fromId", "Unknown")
             decoded = packet.get("decoded", {})
-            position_data = decoded.get("position", {}) or {}
+            position_data = decoded.get("position", {})
 
             if not position_data:
-                # Some firmware uses lat/lon at top-level decoded
-                top_lat = decoded.get("latitude")
-                top_lon = decoded.get("longitude")
-                top_alt = decoded.get("altitude")
-                if top_lat is not None and top_lon is not None:
-                    position_data = {
-                        "latitude": top_lat,
-                        "longitude": top_lon,
-                        "altitude": top_alt,
-                        "speed": decoded.get("speed"),
-                        "ground_track": decoded.get("ground_track"),
-                        "precision_bits": decoded.get("precision_bits"),
-                    }
-                else:
-                    logger.debug(f"No position data in packet from {from_id}")
-                    return
-
-            # Extract position coordinates with fallbacks
-            def _coord(val, scale=None):
-                if val is None:
-                    return None
-                try:
-                    val = float(val)
-                    if scale:
-                        val = val / scale
-                    return val
-                except Exception:
-                    return None
-
-            new_lat = _coord(position_data.get("latitude"))
-            if new_lat is None:
-                new_lat = _coord(position_data.get("latitude_i"), scale=1e7)
-            new_lon = _coord(position_data.get("longitude"))
-            if new_lon is None:
-                new_lon = _coord(position_data.get("longitude_i"), scale=1e7)
-            new_alt = _coord(position_data.get("altitude")) or 0
-
-            # Skip if coordinates are invalid
-            if new_lat is None or new_lon is None:
-                logger.debug(f"Invalid/missing position coordinates from {from_id}")
+                logger.debug(f"No position data in packet from {from_id}")
                 return
+
+            # Extract position coordinates
+            new_lat = (
+                position_data.get("latitude_i", 0) / 1e7
+            )  # Convert from integer to float
+            new_lon = position_data.get("longitude_i", 0) / 1e7
+            new_alt = position_data.get("altitude", 0)
+
+            # Skip if coordinates are invalid (0,0)
             if new_lat == 0 and new_lon == 0:
                 logger.debug(f"Invalid position coordinates (0,0) from {from_id}")
                 return
@@ -6168,17 +5265,18 @@ class DiscordBot(discord.Client):
                 except Exception:
                     threshold_m = 1500
                     cooldown_min = 180
+                cooldown_secs = cooldown_min * 60
+                now_ts = time.time()
 
                 if self.database and channel:
-                    nodes = await asyncio.to_thread(
-                        self.database.get_nodes_with_latest_positions, 500
-                    )
+                    nodes = self.database.get_all_nodes(limit=500)
                     for n in nodes:
                         node_id = n.get("node_id")
-                        if not node_id:
-                            continue
                         long_name = n.get("long_name") or node_id
-                        altitude = n.get("altitude")
+                        pos = self.database.get_last_position(node_id)
+                        if not pos:
+                            continue
+                        altitude = pos.get("altitude")
                         if altitude is None:
                             continue
                         if isinstance(altitude, str):
@@ -6187,61 +5285,55 @@ class DiscordBot(discord.Client):
                             except Exception:
                                 continue
                         if altitude >= float(threshold_m):
-                            recent = (
-                                await asyncio.to_thread(
-                                    self.database.recent_alert_exists,
-                                    node_id,
-                                    "high_altitude",
-                                    cooldown_min,
+                            # DB-backed cooldown
+                            if (
+                                hasattr(self.database, "recent_alert_exists")
+                                and self.database.recent_alert_exists(
+                                    node_id, "high_altitude", cooldown_min
                                 )
-                                if hasattr(self.database, "recent_alert_exists")
-                                else True
-                            )
-                            if recent:
-                                continue
-                            try:
-                                embed = discord.Embed(
-                                    title="✈️ High Altitude Node Detected",
-                                    description=f"**{long_name}** appears to be at high altitude",
-                                    color=0x00FF00,
-                                    timestamp=get_utc_time(),
-                                )
-                                embed.add_field(
-                                    name="Altitude (m)",
-                                    value=f"{altitude:.0f}",
-                                    inline=True,
-                                )
-                                ts = n.get("timestamp")
-                                if ts:
-                                    embed.add_field(
-                                        name="Last Update",
-                                        value=str(ts),
-                                        inline=True,
-                                    )
-                                lat = n.get("latitude")
-                                lon = n.get("longitude")
-                                if lat is not None and lon is not None:
-                                    embed.add_field(
-                                        name="Location",
-                                        value=f"{lat:.5f}, {lon:.5f}",
-                                        inline=True,
+                                is False
+                            ):
+                                try:
+                                    embed = discord.Embed(
+                                        title="✈️ High Altitude Node Detected",
+                                        description=f"**{long_name}** appears to be at high altitude",
+                                        color=0x00FF00,
+                                        timestamp=get_utc_time(),
                                     )
                                     embed.add_field(
-                                        name="Map",
-                                        value=f"https://maps.google.com/?q={lat},{lon}",
+                                        name="Altitude (m)",
+                                        value=f"{altitude:.0f}",
                                         inline=True,
                                     )
-                                await channel.send(embed=embed)
-                                if hasattr(self.database, "record_alert"):
-                                    await asyncio.to_thread(
-                                        self.database.record_alert,
-                                        node_id,
-                                        "high_altitude",
+                                    ts = pos.get("timestamp")
+                                    if ts:
+                                        embed.add_field(
+                                            name="Last Update",
+                                            value=str(ts),
+                                            inline=True,
+                                        )
+                                    lat = pos.get("latitude")
+                                    lon = pos.get("longitude")
+                                    if lat is not None and lon is not None:
+                                        embed.add_field(
+                                            name="Location",
+                                            value=f"{lat:.5f}, {lon:.5f}",
+                                            inline=True,
+                                        )
+                                        embed.add_field(
+                                            name="Map",
+                                            value=f"https://maps.google.com/?q={lat},{lon}",
+                                            inline=True,
+                                        )
+                                    await channel.send(embed=embed)
+                                    if hasattr(self.database, "record_alert"):
+                                        self.database.record_alert(
+                                            node_id, "high_altitude"
+                                        )
+                                except Exception as send_err:
+                                    logger.error(
+                                        f"Failed to send high altitude alert for {node_id}: {send_err}"
                                     )
-                            except Exception as send_err:
-                                logger.error(
-                                    f"Failed to send high altitude alert for {node_id}: {send_err}"
-                                )
                 await asyncio.sleep(60)
             except Exception as e:
                 logger.error(f"Error in high_altitude_task: {e}")
@@ -6330,38 +5422,12 @@ class DiscordBot(discord.Client):
 def main():
     """Main function to run the bot"""
     try:
-        def _env_or_none(*names):
-            for name in names:
-                value = os.getenv(name)
-                if value is not None:
-                    value = value.strip()
-                    if value:
-                        return value
-            return None
-
-        def _env_int(name: str) -> Optional[int]:
-            value = _env_or_none(name)
-            if value is None:
-                return None
-            try:
-                return int(value)
-            except ValueError:
-                logger.warning(f"Invalid integer for {name}: {value!r}")
-                return None
-
         # Load configuration
-        config_kwargs = {
-            "discord_token": os.getenv("DISCORD_TOKEN"),
-            "channel_id": int(os.getenv("DISCORD_CHANNEL_ID", "0")),
-            "meshtastic_hostname": _env_or_none("MESHTASTIC_HOSTNAME"),
-            "meshtastic_serial_port": _env_or_none(
-                "MESHTASTIC_SERIAL_PORT", "MESHTASTIC_PORT"
-            ),
-        }
-        alert_channel_id = _env_int("ALERT_CHANNEL_ID")
-        if alert_channel_id is not None:
-            config_kwargs["alert_channel_id"] = alert_channel_id
-        config = Config(**config_kwargs)
+        config = Config(
+            discord_token=os.getenv("DISCORD_TOKEN"),
+            channel_id=int(os.getenv("DISCORD_CHANNEL_ID", "0")),
+            meshtastic_hostname=os.getenv("MESHTASTIC_HOSTNAME"),
+        )
 
         # Validate configuration
         if not config.discord_token:
@@ -6385,7 +5451,7 @@ def main():
         # Create Meshtastic interface
         try:
             meshtastic_interface = MeshtasticInterface(
-                config.meshtastic_hostname, database, serial_port=config.meshtastic_serial_port
+                config.meshtastic_hostname, database
             )
             logger.info("Meshtastic interface created successfully")
         except Exception as mesh_error:
