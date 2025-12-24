@@ -1,0 +1,29 @@
+services:
+  meshtastic-discord-bot:
+    container_name: meshtastic-discord-bot
+    build: .
+    restart: unless-stopped
+    network_mode: host
+
+    env_file:
+      - .env
+
+    devices:
+      - /dev/serial/by-id:/dev/serial/by-id
+      # Optional fallback:
+      # - /dev/ttyACM0:/dev/ttyACM0
+      # - /dev/ttyUSB0:/dev/ttyUSB0
+
+    privileged: true
+
+    environment:
+      TZ: America/Toronto
+      LOG_LEVEL: INFO
+      # Force serial path preference (your code may read this)
+      MESHTASTIC_PORT: /dev/serial/by-id
+
+    volumes:
+      - ./data:/data
+      - ./logs:/app/logs
+
+    command: ["python", "bot.py"]

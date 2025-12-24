@@ -1,7 +1,7 @@
-# Core dependencies
-discord.py>=2.3.0
-python-dotenv>=1.0.0
-pypubsub>=4.0.0
-meshtastic>=2.0.0
+# Core dependencies - pinned with upper bounds for stability
+discord.py>=2.3.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
+pypubsub>=4.0.0,<5.0.0
+meshtastic>=2.0.0,<3.0.0
 
 # Note: sqlite3 is built into Python, no additional installation needed

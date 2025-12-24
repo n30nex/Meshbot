@@ -1,0 +1,28 @@
+# Environments and virtualenvs
+venv/
+.env
+.env.*
+
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local data/logs
+data/
+logs/
+bot.log
+
+# Legacy local scripts (not needed for Docker)
+manage_bot.bat
+manage_bot.ps1
+start_bot.sh
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Docker artifacts
+*.pid

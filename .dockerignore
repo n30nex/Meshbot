@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+.cursorrules
+
+# Logs and databases (will be mounted as volumes)
+*.log
+*.db
+*.db-shm
+*.db-wal
+bot.log
+
+# Environment files (sensitive data)
+.env
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose*.yml
+
+# Documentation and scripts not needed in container
+README.md
+*.md
+*.bat
+*.ps1
+*.sh
+
+# Test files
+tests/
+test_*.py
+*_test.py
+
+# Data directories (mounted as volumes)
+data/
+logs/
