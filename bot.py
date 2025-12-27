@@ -5,6 +5,8 @@ import sys
 import io
 import json
 import hashlib
+import math
+import re
 import logging
 from logging.handlers import RotatingFileHandler
 import threading
@@ -30,6 +32,7 @@ from config import (
     MAP_SNAPSHOT,
     QUEUE_PERSISTENCE,
     DB_MAINTENANCE,
+    ADSB_LOOKUP,
 )
 
 class JsonFormatter(logging.Formatter):
@@ -5769,6 +5772,8 @@ class DiscordBot(discord.Client):
         self._high_alt_alerts = {}
         # Movement alert cooldown map: node_id -> last_alert_epoch
         self._movement_alerts = {}
+        # Flight lookup cooldown map: node_id -> last_lookup_epoch
+        self._flight_lookup_last = {}
 
         # Restore persisted queues if configured
         self._load_persisted_queues()
@@ -5856,6 +5861,441 @@ class DiscordBot(discord.Client):
             )
         except Exception as e:
             logger.warning(f"Failed to persist queues: {e}")
+
+    def _get_adsb_config(self) -> Dict[str, Any]:
+        defaults = {
+            "endpoint_url": "http://127.0.0.1:8090/data/aircraft.json",
+            "timeout_seconds": 2.5,
+            "cooldown_seconds": 10,
+            "flight_altitude_threshold_m": 5000,
+            "probable_match_threshold": 0.8,
+            "max_distance_km": 80,
+            "max_altitude_delta_m": 2500,
+            "max_seen_pos_seconds": 60,
+            "dist_sigma_km": 20,
+            "alt_sigma_m": 1200,
+            "seen_sigma_s": 15,
+            "min_callsign_length": 4,
+        }
+        try:
+            cfg = dict(ADSB_LOOKUP)
+        except Exception:
+            cfg = {}
+        defaults.update(cfg)
+        return defaults
+
+    def _normalize_callsign(self, callsign: str) -> str:
+        return re.sub(r"\s+", "", callsign or "").upper()
+
+    def _extract_callsigns(self, text: str) -> List[str]:
+        if not text:
+            return []
+        cfg = self._get_adsb_config()
+        upper = text.upper()
+        pattern = re.compile(r"\b([A-Z]{2,3}\s?\d{1,4}[A-Z]?)\b")
+        candidates = []
+        for match in pattern.findall(upper):
+            normalized = self._normalize_callsign(match)
+            if len(normalized) < int(cfg.get("min_callsign_length", 4)):
+                continue
+            if normalized.startswith("FL") and normalized[2:].isdigit():
+                continue
+            if not any(ch.isdigit() for ch in normalized):
+                continue
+            candidates.append(normalized)
+        seen = set()
+        deduped = []
+        for item in candidates:
+            if item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+        return deduped
+
+    def _text_indicates_airborne(self, text: str) -> bool:
+        if not text:
+            return False
+        lowered = text.lower()
+        keywords = [
+            "in the air",
+            "airborne",
+            "cruise",
+            "cruising",
+            "flight level",
+            "takeoff",
+            "taking off",
+            "landing",
+            "on approach",
+            "climbing",
+            "descending",
+        ]
+        if any(word in lowered for word in keywords):
+            return True
+        if re.search(r"\bfl\s?\d{2,3}\b", lowered):
+            return True
+        if re.search(r"\b\d{2,5}\s?(ft|feet)\b", lowered):
+            return True
+        return False
+
+    def _should_rate_limit_flight_lookup(
+        self, node_id: str, cooldown_seconds: float
+    ) -> bool:
+        now = time.time()
+        last_ts = self._flight_lookup_last.get(node_id, 0)
+        if now - last_ts < cooldown_seconds:
+            return True
+        self._flight_lookup_last[node_id] = now
+        return False
+
+    def _schedule_flight_lookup(
+        self,
+        from_id: str,
+        from_name: str,
+        text: Optional[str] = None,
+        position: Optional[Dict[str, Any]] = None,
+        airborne_hint: bool = False,
+    ) -> None:
+        try:
+            loop = self.loop
+        except Exception:
+            return
+        if not loop or loop.is_closed():
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._run_flight_lookup(from_id, from_name, text, position, airborne_hint),
+            loop,
+        )
+
+    async def _run_flight_lookup(
+        self,
+        from_id: str,
+        from_name: str,
+        text: Optional[str],
+        position: Optional[Dict[str, Any]],
+        airborne_hint: bool,
+    ) -> None:
+        cfg = self._get_adsb_config()
+        cooldown_seconds = float(cfg.get("cooldown_seconds", 10))
+        if self._should_rate_limit_flight_lookup(from_id, cooldown_seconds):
+            return
+
+        callsigns = self._extract_callsigns(text or "")
+        last_position = position
+        if last_position is None and self.database:
+            try:
+                last_position = await asyncio.to_thread(
+                    self.database.get_last_position, from_id
+                )
+            except Exception:
+                last_position = None
+
+        if not callsigns:
+            if last_position:
+                altitude = last_position.get("altitude")
+                if altitude is not None:
+                    try:
+                        altitude = float(altitude)
+                    except Exception:
+                        altitude = None
+                if altitude is not None and altitude < float(
+                    cfg.get("flight_altitude_threshold_m", 5000)
+                ):
+                    if not airborne_hint:
+                        return
+            elif not airborne_hint:
+                return
+
+        aircraft = await self._fetch_adsb_aircraft(cfg)
+        if not aircraft:
+            return
+
+        match = self._select_best_aircraft(aircraft, last_position, callsigns, cfg)
+        if match:
+            await self._announce_flight_match(
+                from_id, from_name, match, last_position, callsigns, cfg
+            )
+            return
+
+        if callsigns:
+            await self._request_flight_number(
+                from_id,
+                from_name,
+                text or "",
+                cfg,
+                reason="Unable to match that flight number. Please repeat it.",
+                alert_type="flight_not_found",
+            )
+        else:
+            await self._request_flight_number(
+                from_id,
+                from_name,
+                text or "",
+                cfg,
+                reason="Please send your flight number when you can.",
+                alert_type="flight_request",
+            )
+
+    async def _fetch_adsb_aircraft(self, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        endpoint = cfg.get("endpoint_url")
+        timeout = float(cfg.get("timeout_seconds", 2.5))
+
+        def _fetch() -> List[Dict[str, Any]]:
+            if not endpoint:
+                return []
+            try:
+                resp = requests.get(endpoint, timeout=timeout)
+                resp.raise_for_status()
+                payload = resp.json()
+                return payload.get("aircraft", []) or []
+            except Exception as e:
+                logger.warning(f"ADSB fetch failed: {e}")
+                return []
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception:
+            return await asyncio.get_running_loop().run_in_executor(None, _fetch)
+
+    def _select_best_aircraft(
+        self,
+        aircraft: List[Dict[str, Any]],
+        position: Optional[Dict[str, Any]],
+        callsigns: List[str],
+        cfg: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        max_distance_km = float(cfg.get("max_distance_km", 80))
+        max_alt_delta_m = float(cfg.get("max_altitude_delta_m", 2500))
+        max_seen_pos = float(cfg.get("max_seen_pos_seconds", 60))
+        min_prob = float(cfg.get("probable_match_threshold", 0.8))
+
+        best = None
+        best_score = 0.0
+
+        for plane in aircraft:
+            lat = plane.get("lat")
+            lon = plane.get("lon")
+            if lat is None or lon is None:
+                continue
+
+            flight = self._normalize_callsign(plane.get("flight", ""))
+            if callsigns and not flight:
+                continue
+            if callsigns:
+                matched = False
+                for candidate in callsigns:
+                    if flight.startswith(candidate) or candidate.startswith(flight):
+                        matched = True
+                        break
+                if not matched:
+                    continue
+
+            seen_pos = plane.get("seen_pos")
+            if seen_pos is None:
+                seen_pos = plane.get("seen")
+            try:
+                seen_pos = float(seen_pos) if seen_pos is not None else None
+            except Exception:
+                seen_pos = None
+
+            if seen_pos is not None and seen_pos > max_seen_pos:
+                continue
+
+            dist_km = None
+            alt_diff_m = None
+            if position:
+                try:
+                    dist_m = self.calculate_distance(
+                        float(position.get("latitude")),
+                        float(position.get("longitude")),
+                        float(lat),
+                        float(lon),
+                    )
+                    dist_km = dist_m / 1000.0
+                except Exception:
+                    dist_km = None
+
+                mesh_alt = position.get("altitude")
+                plane_alt_m = self._aircraft_altitude_m(plane)
+                if mesh_alt is not None and plane_alt_m is not None:
+                    try:
+                        alt_diff_m = abs(float(mesh_alt) - plane_alt_m)
+                    except Exception:
+                        alt_diff_m = None
+
+            if not callsigns and dist_km is not None and dist_km > max_distance_km:
+                continue
+            if not callsigns and alt_diff_m is not None and alt_diff_m > max_alt_delta_m:
+                continue
+
+            score = self._score_aircraft_match(
+                dist_km, alt_diff_m, seen_pos, cfg, callsign_boost=bool(callsigns)
+            )
+            if score > best_score:
+                best_score = score
+                best = plane
+                best["match_score"] = score
+                best["match_distance_km"] = dist_km
+                best["match_alt_diff_m"] = alt_diff_m
+                best["match_seen_pos_s"] = seen_pos
+
+        if best and best_score >= min_prob:
+            return best
+        if best and callsigns:
+            return best
+        return None
+
+    def _aircraft_altitude_m(self, plane: Dict[str, Any]) -> Optional[float]:
+        alt_ft = plane.get("alt_baro")
+        if alt_ft is None:
+            alt_ft = plane.get("alt_geom")
+        try:
+            alt_ft = float(alt_ft)
+        except Exception:
+            return None
+        if alt_ft <= 0:
+            return None
+        return alt_ft * 0.3048
+
+    def _score_aircraft_match(
+        self,
+        dist_km: Optional[float],
+        alt_diff_m: Optional[float],
+        seen_pos_s: Optional[float],
+        cfg: Dict[str, Any],
+        callsign_boost: bool = False,
+    ) -> float:
+        dist_sigma = float(cfg.get("dist_sigma_km", 20))
+        alt_sigma = float(cfg.get("alt_sigma_m", 1200))
+        seen_sigma = float(cfg.get("seen_sigma_s", 15))
+
+        dist_score = (
+            math.exp(-((dist_km / dist_sigma) ** 2))
+            if dist_km is not None
+            else 0.0
+        )
+        alt_score = (
+            math.exp(-((alt_diff_m / alt_sigma) ** 2))
+            if alt_diff_m is not None
+            else 0.5
+        )
+        seen_score = (
+            math.exp(-((seen_pos_s / seen_sigma) ** 2))
+            if seen_pos_s is not None
+            else 0.5
+        )
+        score = 0.45 * dist_score + 0.35 * alt_score + 0.2 * seen_score
+        if callsign_boost:
+            score = max(score, 1.0)
+        return min(score, 1.0)
+
+    async def _announce_flight_match(
+        self,
+        from_id: str,
+        from_name: str,
+        plane: Dict[str, Any],
+        position: Optional[Dict[str, Any]],
+        callsigns: List[str],
+        cfg: Dict[str, Any],
+    ) -> None:
+        alert_channel_id = (
+            getattr(self.config, "alert_channel_id", 0) or self.config.channel_id
+        )
+        channel = self.get_channel(alert_channel_id)
+        if not channel:
+            return
+
+        flight = self._normalize_callsign(plane.get("flight", "")) or "Unknown"
+        hex_id = plane.get("hex") or "Unknown"
+        reg = plane.get("r") or "Unknown"
+        aircraft_type = plane.get("t") or "Unknown"
+        alt_m = self._aircraft_altitude_m(plane)
+        gs = plane.get("gs")
+        dist_km = plane.get("match_distance_km")
+        prob = plane.get("match_score", 0.0)
+
+        embed = discord.Embed(
+            title="✈️ Probable Flight Match",
+            description=f"Possible flight for **{from_name}**",
+            color=0x00FF00,
+            timestamp=get_utc_time(),
+        )
+        embed.add_field(name="Flight", value=flight, inline=True)
+        embed.add_field(name="Hex", value=hex_id, inline=True)
+        embed.add_field(name="Registration", value=reg, inline=True)
+        embed.add_field(name="Type", value=aircraft_type, inline=True)
+        if alt_m is not None:
+            embed.add_field(name="Altitude (m)", value=f"{alt_m:.0f}", inline=True)
+        if gs is not None:
+            try:
+                embed.add_field(
+                    name="Speed (kt)", value=f"{float(gs):.0f}", inline=True
+                )
+            except Exception:
+                pass
+        if dist_km is not None:
+            embed.add_field(name="Distance (km)", value=f"{dist_km:.1f}", inline=True)
+        embed.add_field(name="Match", value=f"{prob * 100:.0f}%", inline=True)
+
+        lat = plane.get("lat")
+        lon = plane.get("lon")
+        if lat is not None and lon is not None:
+            embed.add_field(
+                name="Location",
+                value=f"{float(lat):.5f}, {float(lon):.5f}",
+                inline=True,
+            )
+            embed.add_field(
+                name="Map",
+                value=f"https://maps.google.com/?q={lat},{lon}",
+                inline=True,
+            )
+        if callsigns:
+            embed.set_footer(text="Matched using flight number")
+        await channel.send(embed=embed)
+
+    async def _request_flight_number(
+        self,
+        from_id: str,
+        from_name: str,
+        text: str,
+        cfg: Dict[str, Any],
+        reason: str,
+        alert_type: str,
+    ) -> None:
+        cooldown_min = float(cfg.get("cooldown_seconds", 10)) / 60.0
+        if self.database and hasattr(self.database, "recent_alert_exists"):
+            try:
+                recent = await asyncio.to_thread(
+                    self.database.recent_alert_exists,
+                    from_id,
+                    alert_type,
+                    cooldown_min,
+                )
+            except Exception:
+                recent = False
+            if recent:
+                return
+
+        prompt = f"✈️ {from_name}, {reason}"
+        try:
+            self.meshtastic.send_text(prompt, destination_id=from_id)
+        except Exception as e:
+            logger.error(f"Error sending flight prompt to mesh: {e}")
+
+        alert_channel_id = (
+            getattr(self.config, "alert_channel_id", 0) or self.config.channel_id
+        )
+        channel = self.get_channel(alert_channel_id)
+        if channel:
+            await channel.send(
+                f"✈️ Asked **{from_name}** to share their flight number."
+            )
+
+        if self.database and hasattr(self.database, "record_alert"):
+            try:
+                await asyncio.to_thread(self.database.record_alert, from_id, alert_type)
+            except Exception:
+                pass
 
     async def setup_hook(self) -> None:
         """Setup bot when starting"""
@@ -6922,6 +7362,20 @@ class DiscordBot(discord.Client):
                 except Exception as msg_error:
                     logger.error(f"Error storing message in database: {msg_error}")
 
+                try:
+                    if from_id and from_id != "Unknown":
+                        airborne_hint = self._text_indicates_airborne(text)
+                        callsigns = self._extract_callsigns(text)
+                        if airborne_hint or callsigns:
+                            self._schedule_flight_lookup(
+                                from_id,
+                                from_name,
+                                text=text,
+                                airborne_hint=airborne_hint,
+                            )
+                except Exception as flight_err:
+                    logger.debug(f"Flight lookup trigger failed: {flight_err}")
+
             # Handle telemetry packets
             elif portnum == "TELEMETRY_APP":
                 try:
@@ -7708,6 +8162,30 @@ class DiscordBot(discord.Client):
                     )
                 except Exception as pos_error:
                     logger.error(f"Error storing position for {from_id}: {pos_error}")
+
+            try:
+                cfg = self._get_adsb_config()
+                threshold = float(cfg.get("flight_altitude_threshold_m", 5000))
+                if new_alt is not None and float(new_alt) >= threshold:
+                    from_name = (
+                        self.database.get_node_display_name(from_id)
+                        if self.database
+                        else from_id
+                    )
+                    position_payload = {
+                        "latitude": new_lat,
+                        "longitude": new_lon,
+                        "altitude": new_alt,
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                    }
+                    self._schedule_flight_lookup(
+                        from_id,
+                        from_name,
+                        position=position_payload,
+                        airborne_hint=True,
+                    )
+            except Exception as flight_err:
+                logger.debug(f"Flight lookup trigger failed: {flight_err}")
 
         except Exception as e:
             logger.error(f"Error processing position packet: {e}")

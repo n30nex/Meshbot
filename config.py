@@ -155,3 +155,19 @@ MOVEMENT_DETECTION = {
     'min_interval_seconds': 15,
     'alert_cooldown_seconds': 300,
 }
+
+# ADSB flight lookup settings
+ADSB_LOOKUP = {
+    'endpoint_url': 'http://127.0.0.1:8090/data/aircraft.json',
+    'timeout_seconds': 2.5,
+    'cooldown_seconds': 10,
+    'flight_altitude_threshold_m': 5000,
+    'probable_match_threshold': 0.8,
+    'max_distance_km': 80,
+    'max_altitude_delta_m': 2500,
+    'max_seen_pos_seconds': 60,
+    'dist_sigma_km': 20,
+    'alt_sigma_m': 1200,
+    'seen_sigma_s': 15,
+    'min_callsign_length': 4,
+}

@@ -1,6 +1,10 @@
-# Meshtastic Discord Bridge Bot – v2.6
+# Meshtastic Discord Bridge Bot – v2.7
 
 Docker-first bridge between Meshtastic and Discord, with telemetry, locations, and topology views.
+
+## What’s new in 2.7
+- ADSB flight matching for airborne mesh nodes: looks up aircraft from the combined feed and posts a probable match with confidence.
+- Flight-number prompts when a high-altitude node reports position or mentions being airborne without a callsign (rate-limited).
 
 ## What’s new in 2.6
 - Docker workflow by default; local scripts removed.
@@ -42,12 +46,14 @@ Topology and tables:
 ## Configuration (config.py)
 - `BOT_CONFIG`: thresholds, rate limits, watchdog, geocode toggles (`geocode_enabled`, `geocode_max_per_run`, `geocode_timeout`), pagination size (`node_page_size`).
 - `HIGH_ALTITUDE`: thresholds/cooldowns for altitude alerts.
+- `ADSB_LOOKUP`: ADSB endpoint (`endpoint_url`), timeouts, 10s prompt cooldown, altitude threshold, and match scoring tunables.
 - `LOGGING_CONFIG`: level/format/file.
 
 ## Behavior Notes
 - Reverse geocoding is optional and rate-limited; disable with `geocode_enabled=False` if undesired.
 - Data persistence is under `./data` (mounted to `/data` in Docker).
 - Presence/new-node announcements remain conservative to avoid noise.
+- ADSB matching uses the combined feed by default (`http://127.0.0.1:8090/data/aircraft.json`).
 
 ## Development
 - Dependencies: see `requirements.txt`.
