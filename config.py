@@ -159,6 +159,7 @@ MOVEMENT_DETECTION = {
 # ADSB flight lookup settings
 ADSB_LOOKUP = {
     'endpoint_url': 'http://127.0.0.1:8090/data/aircraft.json',
+    'webui_base_url': 'https://adsb.canadaverse.org/?icao=',
     'timeout_seconds': 2.5,
     'cooldown_seconds': 10,
     'flight_altitude_threshold_m': 5000,
@@ -166,6 +167,9 @@ ADSB_LOOKUP = {
     'max_distance_km': 80,
     'max_altitude_delta_m': 2500,
     'max_seen_pos_seconds': 60,
+    'mesh_out_of_range_seconds': 300,
+    'adsb_out_of_range_seconds': 120,
+    'flight_monitor_interval_seconds': 30,
     'dist_sigma_km': 20,
     'alt_sigma_m': 1200,
     'seen_sigma_s': 15,

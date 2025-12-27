@@ -5764,6 +5764,7 @@ class DiscordBot(discord.Client):
         self.telemetry_task = None
         self.high_altitude_task_handle = None
         self.db_maintenance_task_handle = None
+        self.flight_monitor_task_handle = None
 
         # Track last telemetry update hour
         self.last_telemetry_hour = datetime.now().hour
@@ -5774,6 +5775,10 @@ class DiscordBot(discord.Client):
         self._movement_alerts = {}
         # Flight lookup cooldown map: node_id -> last_lookup_epoch
         self._flight_lookup_last = {}
+        # Flight tracking state keyed by node_id
+        self._flight_tracks = {}
+        # Nodes that already received initial Safe Flight message
+        self._flight_initial_safe_sent = set()
 
         # Restore persisted queues if configured
         self._load_persisted_queues()
@@ -5865,6 +5870,7 @@ class DiscordBot(discord.Client):
     def _get_adsb_config(self) -> Dict[str, Any]:
         defaults = {
             "endpoint_url": "http://127.0.0.1:8090/data/aircraft.json",
+            "webui_base_url": "https://adsb.canadaverse.org/?icao=",
             "timeout_seconds": 2.5,
             "cooldown_seconds": 10,
             "flight_altitude_threshold_m": 5000,
@@ -5872,6 +5878,9 @@ class DiscordBot(discord.Client):
             "max_distance_km": 80,
             "max_altitude_delta_m": 2500,
             "max_seen_pos_seconds": 60,
+            "mesh_out_of_range_seconds": 300,
+            "adsb_out_of_range_seconds": 120,
+            "flight_monitor_interval_seconds": 30,
             "dist_sigma_km": 20,
             "alt_sigma_m": 1200,
             "seen_sigma_s": 15,
@@ -6004,6 +6013,8 @@ class DiscordBot(discord.Client):
                         return
             elif not airborne_hint:
                 return
+
+        self._maybe_send_initial_safe_flight(from_id)
 
         aircraft = await self._fetch_adsb_aircraft(cfg)
         if not aircraft:
@@ -6156,6 +6167,14 @@ class DiscordBot(discord.Client):
             return None
         return alt_ft * 0.3048
 
+    def _adsb_webui_link(self, hex_id: Optional[str], cfg: Dict[str, Any]) -> Optional[str]:
+        if not hex_id:
+            return None
+        base_url = str(cfg.get("webui_base_url") or "").strip()
+        if not base_url:
+            return None
+        return f"{base_url}{hex_id.lower()}"
+
     def _score_aircraft_match(
         self,
         dist_km: Optional[float],
@@ -6244,14 +6263,25 @@ class DiscordBot(discord.Client):
                 value=f"{float(lat):.5f}, {float(lon):.5f}",
                 inline=True,
             )
-            embed.add_field(
-                name="Map",
-                value=f"https://maps.google.com/?q={lat},{lon}",
-                inline=True,
-            )
+        webui_link = self._adsb_webui_link(hex_id if hex_id != "Unknown" else None, cfg)
+        if webui_link:
+            embed.add_field(name="WebUI", value=webui_link, inline=True)
         if callsigns:
             embed.set_footer(text="Matched using flight number")
         await channel.send(embed=embed)
+
+        now_ts = time.time()
+        track = self._flight_tracks.get(from_id, {})
+        self._flight_tracks[from_id] = {
+            "node_id": from_id,
+            "node_name": from_name,
+            "flight": flight,
+            "hex": hex_id if hex_id != "Unknown" else None,
+            "last_mesh_seen_ts": now_ts,
+            "last_adsb_seen_ts": now_ts,
+            "safe_flight_announced": track.get("safe_flight_announced", False),
+            "adsb_out_announced": track.get("adsb_out_announced", False),
+        }
 
     async def _request_flight_number(
         self,
@@ -6297,12 +6327,26 @@ class DiscordBot(discord.Client):
             except Exception:
                 pass
 
+    def _maybe_send_initial_safe_flight(self, node_id: str) -> None:
+        if not node_id or node_id in self._flight_initial_safe_sent:
+            return
+        try:
+            self.meshtastic.send_text(f"Safe Flight {node_id}!", destination_id=node_id)
+            self._flight_initial_safe_sent.add(node_id)
+        except Exception as send_err:
+            logger.error(
+                f"Error sending initial Safe Flight to {node_id}: {send_err}"
+            )
+
     async def setup_hook(self) -> None:
         """Setup bot when starting"""
         self.bg_task = self.loop.create_task(self.background_task())
         self.telemetry_task = self.loop.create_task(self.telemetry_update_task())
         self.high_altitude_task_handle = self.loop.create_task(
             self.high_altitude_task()
+        )
+        self.flight_monitor_task_handle = self.loop.create_task(
+            self.flight_monitor_task()
         )
         if DB_MAINTENANCE.get("enabled", True):
             self.db_maintenance_task_handle = self.loop.create_task(
@@ -7239,6 +7283,11 @@ class DiscordBot(discord.Client):
                     self.database.update_last_heard(from_id, ts)
             except Exception as lh_err:
                 logger.error(f"Error updating last_heard for {from_id}: {lh_err}")
+            try:
+                if from_id in self._flight_tracks:
+                    self._flight_tracks[from_id]["last_mesh_seen_ts"] = time.time()
+            except Exception as track_err:
+                logger.debug(f"Flight tracking update failed for {from_id}: {track_err}")
 
             try:
                 if from_id and self.database:
@@ -8303,6 +8352,84 @@ class DiscordBot(discord.Client):
             except Exception as e:
                 logger.error(f"Error in high_altitude_task: {e}")
                 await asyncio.sleep(60)
+
+    async def flight_monitor_task(self):
+        """Monitor tracked flights for mesh or ADSB out-of-range events."""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            cfg = self._get_adsb_config()
+            interval = float(cfg.get("flight_monitor_interval_seconds", 30))
+            try:
+                if not self._flight_tracks:
+                    await asyncio.sleep(interval)
+                    continue
+
+                aircraft = await self._fetch_adsb_aircraft(cfg)
+                by_hex = {}
+                for plane in aircraft:
+                    hex_id = plane.get("hex")
+                    if hex_id:
+                        by_hex[str(hex_id).lower()] = plane
+
+                now_ts = time.time()
+                mesh_out_seconds = float(cfg.get("mesh_out_of_range_seconds", 300))
+                adsb_out_seconds = float(cfg.get("adsb_out_of_range_seconds", 120))
+                max_seen_pos = float(cfg.get("max_seen_pos_seconds", 60))
+
+                alert_channel_id = (
+                    getattr(self.config, "alert_channel_id", 0) or self.config.channel_id
+                )
+                channel = self.get_channel(alert_channel_id)
+
+                for node_id, track in list(self._flight_tracks.items()):
+                    flight = track.get("flight") or "Unknown"
+                    node_name = track.get("node_name") or node_id
+
+                    last_mesh_seen = track.get("last_mesh_seen_ts")
+                    if (
+                        last_mesh_seen
+                        and not track.get("safe_flight_announced")
+                        and now_ts - float(last_mesh_seen) >= mesh_out_seconds
+                    ):
+                        if channel:
+                            await channel.send(
+                                f"✈️ Safe flight {node_name} on flight {flight}!"
+                            )
+                        track["safe_flight_announced"] = True
+
+                    hex_id = track.get("hex")
+                    if hex_id:
+                        last_adsb_seen = track.get("last_adsb_seen_ts")
+                        plane = by_hex.get(str(hex_id).lower())
+                        seen_pos = None
+                        if plane:
+                            seen_pos = plane.get("seen_pos")
+                            if seen_pos is None:
+                                seen_pos = plane.get("seen")
+                            try:
+                                seen_pos = (
+                                    float(seen_pos) if seen_pos is not None else None
+                                )
+                            except Exception:
+                                seen_pos = None
+                            if seen_pos is None or seen_pos <= max_seen_pos:
+                                track["last_adsb_seen_ts"] = now_ts
+
+                        if (
+                            not track.get("adsb_out_announced")
+                            and last_adsb_seen
+                            and now_ts - float(last_adsb_seen) >= adsb_out_seconds
+                        ):
+                            if channel:
+                                await channel.send(
+                                    f"✈️ Flight {flight} is now out of ADSB range"
+                                )
+                            track["adsb_out_announced"] = True
+
+                await asyncio.sleep(interval)
+            except Exception as e:
+                logger.error(f"Error in flight_monitor_task: {e}")
+                await asyncio.sleep(interval)
 
     def calculate_distance(
         self, lat1: float, lon1: float, lat2: float, lon2: float
